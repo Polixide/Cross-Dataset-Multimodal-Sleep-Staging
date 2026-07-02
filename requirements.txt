@@ -1,0 +1,26 @@
+# Core scientific stack
+numpy
+scipy
+pandas
+scikit-learn
+
+# EDF / PSG signal handling
+mne
+
+# Class imbalance (SMOTE and imbalanced pipelines)
+imbalanced-learn
+
+# Deep learning baselines
+torch
+
+# Explainability
+shap
+
+# Visualization
+matplotlib
+seaborn
+
+# Notebooks, utilities and testing
+jupyter
+tqdm
+pytest

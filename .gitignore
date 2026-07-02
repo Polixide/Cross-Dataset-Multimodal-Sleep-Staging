@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+.pytest_cache
+.ipynb_checkpoints/
+.pytest_cache/
+*.egg-info/
+
+# Data — large and/or access-restricted; keep the folder structure only
+data/raw/*
+data/processed/*
+data/splits/*
+!data/raw/.gitkeep
+!data/processed/.gitkeep
+!data/splits/.gitkeep
+
+# Results — generated artifacts; keep the folders only
+results/tables/*
+results/figures/*
+results/logs/*
+!results/tables/.gitkeep
+!results/figures/.gitkeep
+!results/logs/.gitkeep
+
+# Trained models / large binaries
+*.pt
+*.pth
+*.pkl
+*.joblib
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Not published to GitHub for now (kept locally)
+notebooks/
+docs/
+CLAUDE.md
+.claude/
