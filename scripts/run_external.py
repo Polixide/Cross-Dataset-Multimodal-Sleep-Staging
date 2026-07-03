@@ -1,4 +1,4 @@
-"""External validation of a frozen ML model on a second dataset (e.g. SHHS).
+"""External validation of a frozen ML model on a second dataset (e.g. HMC).
 
 Loads a model trained on the development dataset (Sleep-EDF) and evaluates it,
 without any re-tuning, on an external processed dataset — quantifying
@@ -7,7 +7,7 @@ deep-learning model, use scripts/run_dl.py --external instead.
 
 Usage:
     python scripts/run_external.py --model-path results/logs/ml_model.pkl \
-        --external data/processed/shhs.npz
+        --external data/processed/hmc.npz
 """
 import argparse
 import sys
@@ -30,7 +30,8 @@ def main():
     parser = argparse.ArgumentParser(description="Evaluate a frozen ML model on an external dataset.")
     parser.add_argument("--model-path", required=True, help="Pickled fitted estimator.")
     parser.add_argument("--external", required=True, help="External processed .npz (x, y, subjects).")
-    parser.add_argument("--sfreq", type=float, default=100.0)
+    parser.add_argument("--sfreq", type=float, default=None,
+                        help="Override the sampling rate; defaults to the value stored in the .npz.")
     parser.add_argument("--out", default="results/tables/external_metrics.json")
     parser.add_argument("--probs-out", default="results/logs/external_test_probs.npz")
     args = parser.parse_args()
@@ -43,8 +44,9 @@ def main():
     # Extract the same features used in training if the external data is raw epochs.
     x = dataset.x
     if x.ndim == 3:
-        logger.info("Extracting features from raw external epochs...")
-        x, _ = extract_features_dataset(x, args.sfreq)
+        sfreq = args.sfreq or dataset.sfreq or 100.0
+        logger.info("Extracting features from raw external epochs (sfreq=%g Hz)...", sfreq)
+        x, _ = extract_features_dataset(x, sfreq)
 
     y_pred = model.predict(x)
     metrics = compute_metrics(dataset.y, y_pred, labels=LABELS)

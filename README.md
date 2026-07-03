@@ -19,8 +19,8 @@ closes that gap with a single coherent benchmark:
 
 - **Subject-independent evaluation** — all splits are subject-wise; no subject
   appears in more than one split.
-- **External validation** — a model trained on Sleep-EDF is tested, frozen, on
-  SHHS to measure real cross-dataset generalization.
+- **External validation** — a model trained on Sleep-EDF is tested, frozen, on a
+  second dataset (HMC) to measure real cross-dataset generalization.
 - **ML vs DL under one protocol** — feature-based classifiers and raw-signal
   deep models are compared on the same data and metrics.
 - **Beyond accuracy** — macro-F1, Cohen's kappa, per-class F1, confusion
@@ -31,8 +31,13 @@ closes that gap with a single coherent benchmark:
 | Role | Dataset | Purpose |
 | --- | --- | --- |
 | Development | **Sleep-EDF Expanded** | Training + internal subject-wise validation |
-| External test | **HMC** / **SHHS** | PSG-to-PSG cross-dataset generalization |
+| External test | **HMC** | PSG-to-PSG cross-dataset generalization |
 | Optional extension | **DREAMT** | Wearable transfer — future work (different modality) |
+
+> **Deviation from `docs/master_plan.md`:** the master plan's primary external
+> dataset needs an access agreement that takes weeks to obtain, so this project
+> uses the open-access **HMC** (still PSG-to-PSG) as the external test set
+> instead. DREAMT stays optional.
 
 Data are **not** committed to the repository. See [`data/README.md`](data/README.md)
 for how to obtain and place them.
@@ -62,21 +67,24 @@ Prepare data, then run a baseline:
 # 1. Build model-ready epochs (see scripts for arguments)
 python scripts/prepare_sleep_edf.py --raw-dir data/raw/sleep_edf --out data/processed/sleep_edf.npz
 
-# 2. Feature-based ML with subject-wise cross-validation
-python scripts/run_ml.py --data data/processed/sleep_edf.npz --model rf
+# 2. Feature correlation + importance figures (EDA; motivates selection)
+python scripts/analyze_features.py --data data/processed/sleep_edf.npz
 
-# 3. Deep learning — Cross-Modal Transformer with temporal context
+# 3. Feature-based ML with subject-wise cross-validation (+ optional selection)
+python scripts/run_ml.py --data data/processed/sleep_edf.npz --model rf --feature-selection
+
+# 4. Deep learning — Cross-Modal Transformer with temporal context
 python scripts/run_dl.py --data data/processed/sleep_edf.npz --model transformer --context 11
 
-# 4. External validation on a second dataset (frozen model)
+# 5. External validation on a second dataset (frozen model)
 python scripts/run_external.py --model-path results/logs/ml_model.pkl --external data/processed/hmc.npz
 ```
 
 ## Tests
 
 The tests cover the methodology-critical logic — subject-wise splits and the
-leakage guard, label mapping, training-only normalization, and metric
-computation:
+leakage guard, label mapping, filtering/resampling, training-only normalization,
+leakage-safe feature selection, and metric computation:
 
 ```bash
 pytest
@@ -87,8 +95,13 @@ pytest
 The full pipeline is implemented and tested:
 
 - **Data:** subject-wise splitting with a leakage guard, label harmonization,
-  training-only normalization, and feature extraction (time / frequency /
-  nonlinear / time-frequency) for the ML pipeline.
+  band-pass filtering + resampling to a shared sampling rate (stored in the
+  `.npz`), training-only normalization, and feature extraction (time / frequency
+  / nonlinear / time-frequency — 96 features) for the ML pipeline.
+- **Feature selection:** optional leakage-safe pruning (near-constant + collinear
+  features, optional top-k by importance) built as pipeline steps so it re-fits
+  inside every CV fold; `analyze_features.py` saves the correlation-matrix and
+  feature-importance figures that motivate it.
 - **Models:** feature-based ML (SVM, RF, gradient boosting, logistic — scaled
   where needed) and deep learning (1D-CNN, CNN-LSTM, and the Cross-Modal
   Transformer with modality masking for ablations and missing-modality tests).
@@ -106,9 +119,9 @@ The full pipeline is implemented and tested:
 - **Validation:** internal held-out test, external cross-dataset validation, and
   LOSO robustness; figures via `make_figures.py`.
 
-The data-preparation scripts (`prepare_sleep_edf.py`, `prepare_hmc.py`,
-`prepare_shhs.py`) follow the standard dataset formats and need the actual
-datasets in `data/raw/` to run. Everything else is verified on synthetic data and
-by the test suite (`pytest`, 27 tests). One documented design choice: DL
+The data-preparation scripts (`prepare_sleep_edf.py`, `prepare_hmc.py`) follow
+the standard dataset formats and need the actual datasets in `data/raw/` to run.
+Everything else is verified on synthetic data and
+by the test suite (`pytest`, 33 tests). One documented design choice: DL
 hyperparameter search uses random search rather than Bayesian optimization, to
 avoid an extra dependency.

@@ -21,7 +21,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import mne
 import numpy as np
 
-from src.preprocessing import RAW_LABEL_TO_INDEX
+from src.preprocessing import (
+    DEFAULT_H_FREQ,
+    DEFAULT_L_FREQ,
+    DEFAULT_TARGET_SFREQ,
+    RAW_LABEL_TO_INDEX,
+    filter_and_resample_raw,
+)
 from src.utils import EPOCH_SECONDS, SLEEP_EDF_CHANNELS, ensure_dir, get_logger
 
 logger = get_logger("prepare_sleep_edf")
@@ -31,13 +37,17 @@ ANNOTATION_TO_CODE = {desc: code for code, desc in enumerate(RAW_LABEL_TO_INDEX,
 CODE_TO_CLASS = {code: RAW_LABEL_TO_INDEX[desc] for desc, code in ANNOTATION_TO_CODE.items()}
 
 
-def process_recording(psg_path, hypnogram_path, channels):
+def process_recording(psg_path, hypnogram_path, channels,
+                      l_freq=DEFAULT_L_FREQ, h_freq=DEFAULT_H_FREQ,
+                      target_sfreq=DEFAULT_TARGET_SFREQ):
     """Return (epochs, labels) for one PSG + hypnogram pair.
 
+    The continuous recording is band-pass filtered and resampled before epoching.
     epochs has shape (n_epochs, n_channels, n_samples); labels are in [0, 4].
     """
     raw = mne.io.read_raw_edf(psg_path, preload=True, verbose=False)
     raw.pick(channels)
+    filter_and_resample_raw(raw, l_freq, h_freq, target_sfreq)
 
     annotations = mne.read_annotations(hypnogram_path)
     raw.set_annotations(annotations, emit_warning=False)
@@ -62,6 +72,10 @@ def main():
     parser.add_argument("--raw-dir", default="data/raw/sleep_edf")
     parser.add_argument("--out", default="data/processed/sleep_edf.npz")
     parser.add_argument("--channels", nargs="+", default=SLEEP_EDF_CHANNELS)
+    parser.add_argument("--l-freq", type=float, default=DEFAULT_L_FREQ)
+    parser.add_argument("--h-freq", type=float, default=DEFAULT_H_FREQ)
+    parser.add_argument("--target-sfreq", type=float, default=DEFAULT_TARGET_SFREQ,
+                        help="Resample to this rate so datasets share one sampling rate.")
     args = parser.parse_args()
 
     raw_dir = Path(args.raw_dir)
@@ -77,7 +91,8 @@ def main():
             logger.warning("No hypnogram for %s, skipping.", psg_path.name)
             continue
 
-        x, y = process_recording(psg_path, hypnograms[0], args.channels)
+        x, y = process_recording(psg_path, hypnograms[0], args.channels,
+                                 args.l_freq, args.h_freq, args.target_sfreq)
         subject = psg_path.name[3:5]  # night-independent subject id
         all_x.append(x)
         all_y.append(y)
@@ -89,9 +104,9 @@ def main():
     subjects = np.concatenate(all_subjects)
 
     ensure_dir(Path(args.out).parent)
-    np.savez_compressed(args.out, x=x, y=y, subjects=subjects)
-    logger.info("Saved %d epochs from %d subjects to %s",
-                len(y), len(np.unique(subjects)), args.out)
+    np.savez_compressed(args.out, x=x, y=y, subjects=subjects, sfreq=args.target_sfreq)
+    logger.info("Saved %d epochs from %d subjects to %s (sfreq=%g Hz)",
+                len(y), len(np.unique(subjects)), args.out, args.target_sfreq)
 
 
 if __name__ == "__main__":

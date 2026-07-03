@@ -16,7 +16,7 @@ Examples:
     python scripts/run_dl.py --data data/processed/sleep_edf.npz --model transformer
     python scripts/run_dl.py --data data/processed/sleep_edf.npz --model cnn --context 15
     python scripts/run_dl.py --data data/processed/sleep_edf.npz --model transformer \
-        --context 11 --external data/processed/shhs.npz
+        --context 11 --external data/processed/hmc.npz
 """
 import argparse
 import sys

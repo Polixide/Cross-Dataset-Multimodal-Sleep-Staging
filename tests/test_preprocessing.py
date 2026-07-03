@@ -1,13 +1,21 @@
-"""Tests for label harmonization and training-only normalization."""
+"""Tests for label harmonization, filtering/resampling and training-only normalization."""
+import mne
 import numpy as np
 
 from src.preprocessing import (
     apply_normalizer,
+    filter_and_resample_raw,
     fit_normalizer,
     map_stage_label,
     map_stage_labels,
     stage_label_from_text,
 )
+
+
+def _band_power(signal, sfreq, low, high):
+    spectrum = np.abs(np.fft.rfft(signal)) ** 2
+    freqs = np.fft.rfftfreq(len(signal), d=1.0 / sfreq)
+    return spectrum[(freqs >= low) & (freqs < high)].sum()
 
 
 def test_label_mapping_merges_n3_n4_and_drops_unknown():
@@ -61,3 +69,19 @@ def test_normalizer_uses_training_stats_on_new_data():
     x_test = np.ones((4, 1, 20)) * 10.0
     x_test_norm = apply_normalizer(x_test, mean, std)
     assert not np.allclose(x_test_norm.mean(), 0.0)
+
+
+def test_filter_and_resample_changes_rate_and_attenuates_high_freq():
+    sfreq = 200.0
+    t = np.arange(0, 20, 1.0 / sfreq)
+    # equal-amplitude 10 Hz (kept) and 45 Hz (above the 35 Hz cutoff -> removed)
+    signal = np.sin(2 * np.pi * 10 * t) + np.sin(2 * np.pi * 45 * t)
+    info = mne.create_info(["EEG"], sfreq, ch_types="eeg")
+    raw = mne.io.RawArray(signal[np.newaxis, :], info, verbose=False)
+
+    filter_and_resample_raw(raw, l_freq=0.3, h_freq=35.0, target_sfreq=100.0)
+
+    assert raw.info["sfreq"] == 100.0
+    out = raw.get_data()[0]
+    # the 45 Hz component should be strongly attenuated relative to the 10 Hz one
+    assert _band_power(out, 100.0, 40, 50) < 0.05 * _band_power(out, 100.0, 5, 15)

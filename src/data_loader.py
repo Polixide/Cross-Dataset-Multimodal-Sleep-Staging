@@ -17,11 +17,15 @@ class EpochDataset:
     x        : signals (n_epochs, n_channels, n_samples) or features (n_epochs, n_features)
     y        : integer sleep-stage labels (n_epochs,)
     subjects : subject id per epoch (n_epochs,), used as the grouping key for splits
+    sfreq    : sampling rate (Hz) the epochs were resampled to, or None if unknown.
+               Stored by the prepare_*.py scripts so feature extraction uses the
+               real rate instead of a hardcoded guess.
     """
 
     x: np.ndarray
     y: np.ndarray
     subjects: np.ndarray
+    sfreq: float = None
 
     def __post_init__(self):
         if not (len(self.x) == len(self.y) == len(self.subjects)):
@@ -33,9 +37,10 @@ class EpochDataset:
 
 
 def load_processed_dataset(path):
-    """Load a preprocessed dataset saved as a single .npz with x, y, subjects."""
+    """Load a preprocessed dataset saved as a single .npz with x, y, subjects[, sfreq]."""
     data = np.load(path, allow_pickle=True)
-    return EpochDataset(x=data["x"], y=data["y"], subjects=data["subjects"])
+    sfreq = float(data["sfreq"]) if "sfreq" in data.files else None
+    return EpochDataset(x=data["x"], y=data["y"], subjects=data["subjects"], sfreq=sfreq)
 
 
 def check_no_subject_overlap(*subject_groups):

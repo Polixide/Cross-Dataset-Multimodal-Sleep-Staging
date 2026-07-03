@@ -30,19 +30,34 @@ LABELS = list(range(len(STAGE_NAMES)))
 
 
 def get_feature_matrix(dataset, sfreq):
-    """Return a 2D feature matrix, extracting features if the data is raw epochs."""
+    """Return (feature_matrix, feature_names), extracting features if data is raw epochs.
+
+    feature_names is None when the dataset is already a 2D feature matrix.
+    """
     if dataset.x.ndim == 3:
-        logger.info("Extracting features from raw epochs (%d epochs)...", len(dataset.y))
-        features, _ = extract_features_dataset(dataset.x, sfreq)
-        return features
-    return dataset.x
+        logger.info("Extracting features from raw epochs (%d epochs, sfreq=%g Hz)...",
+                    len(dataset.y), sfreq)
+        return extract_features_dataset(dataset.x, sfreq)
+    return dataset.x, None
 
 
-def run_loso(x, y, subjects, model, balance, out_path):
+def selected_feature_count(fitted_model):
+    """Best-effort count of features surviving the pipeline's selection steps."""
+    if not hasattr(fitted_model, "named_steps"):
+        return None
+    n = None
+    for step_name in ("variance_filter", "correlation_pruner", "model_select"):
+        step = fitted_model.named_steps.get(step_name)
+        if step is not None and hasattr(step, "get_support"):
+            n = int(np.sum(step.get_support()))
+    return n
+
+
+def run_loso(x, y, subjects, model, balance, feature_selection, out_path):
     """Leave-one-subject-out robustness analysis (secondary)."""
     y_true, y_pred = [], []
     for train_idx, test_idx in leave_one_subject_out(subjects):
-        estimator = build_estimator(model, balance)
+        estimator = build_estimator(model, balance, feature_selection=feature_selection)
         estimator.fit(x[train_idx], y[train_idx])
         y_pred.append(estimator.predict(x[test_idx]))
         y_true.append(y[test_idx])
@@ -60,7 +75,14 @@ def main():
     parser.add_argument("--folds", type=int, default=5)
     parser.add_argument("--tune", action="store_true", help="Grid-search hyperparameters.")
     parser.add_argument("--loso", action="store_true", help="Run leave-one-subject-out instead.")
-    parser.add_argument("--sfreq", type=float, default=100.0)
+    parser.add_argument("--feature-selection", action="store_true",
+                        help="Prepend leakage-safe variance + correlation feature pruning.")
+    parser.add_argument("--corr-threshold", type=float, default=0.95,
+                        help="Prune features whose |correlation| exceeds this (with --feature-selection).")
+    parser.add_argument("--select-k", type=int, default=None,
+                        help="Optionally keep only the top-k features by RF importance.")
+    parser.add_argument("--sfreq", type=float, default=None,
+                        help="Override the sampling rate; defaults to the value stored in the .npz.")
     parser.add_argument("--out", default="results/tables/ml_metrics.json")
     parser.add_argument("--model-out", default="results/logs/ml_model.pkl")
     parser.add_argument("--probs-out", default="results/logs/ml_test_probs.npz")
@@ -68,13 +90,22 @@ def main():
 
     set_seed()
     dataset = load_processed_dataset(args.data)
-    x = get_feature_matrix(dataset, args.sfreq)
+    sfreq = args.sfreq or dataset.sfreq or 100.0
+    x, feature_names = get_feature_matrix(dataset, sfreq)
     y, subjects = dataset.y, dataset.subjects
     logger.info("Loaded %d epochs from %d subjects (%d features).",
                 len(y), dataset.n_subjects, x.shape[1])
 
+    # Leakage-safe feature selection: config lives in the estimator, so it is
+    # re-fit on the training portion of every CV fold (never sees val/test).
+    feature_selection = None
+    if args.feature_selection:
+        feature_selection = {"correlation_threshold": args.corr_threshold, "k_best": args.select_k}
+        logger.info("Feature selection ON (|corr|>%.2f%s).", args.corr_threshold,
+                    f", top-{args.select_k}" if args.select_k else "")
+
     if args.loso:
-        run_loso(x, y, subjects, args.model, args.balance, args.out)
+        run_loso(x, y, subjects, args.model, args.balance, feature_selection, args.out)
         return
 
     train_idx, val_idx, test_idx = subject_wise_split(subjects)
@@ -83,7 +114,7 @@ def main():
     # Cross-validation on the development subjects (for tuning / robustness).
     n_splits = min(args.folds, len(np.unique(subjects[dev_idx])))
     cv_metrics = cross_validate_ml(
-        lambda: build_estimator(args.model, args.balance),
+        lambda: build_estimator(args.model, args.balance, feature_selection=feature_selection),
         x[dev_idx], y[dev_idx], subjects[dev_idx], n_splits=n_splits, labels=LABELS,
     )
     cv_summary = summarize_folds(cv_metrics)
@@ -95,12 +126,12 @@ def main():
     if args.tune:
         tune_splits = min(args.folds, len(np.unique(subjects[train_idx])))
         final_model, best_params, best_score = tune_ml(
-            build_estimator(args.model, args.balance), args.model,
-            x[train_idx], y[train_idx], subjects[train_idx], n_splits=tune_splits,
+            build_estimator(args.model, args.balance, feature_selection=feature_selection),
+            args.model, x[train_idx], y[train_idx], subjects[train_idx], n_splits=tune_splits,
         )
         logger.info("Best params: %s (CV macro-F1 %.3f)", best_params, best_score)
     else:
-        final_model = build_estimator(args.model, args.balance)
+        final_model = build_estimator(args.model, args.balance, feature_selection=feature_selection)
         final_model.fit(x[train_idx], y[train_idx])
 
     # Calibrate on the validation subjects only, then evaluate on the held-out test.
@@ -119,6 +150,9 @@ def main():
     np.savez_compressed(args.probs_out, y_true=y[test_idx], y_prob=prob_cal, y_prob_raw=prob_raw)
     save_json({
         "model": args.model, "balance": args.balance, "tuned": args.tune, "best_params": best_params,
+        "sfreq": sfreq, "n_features_total": int(x.shape[1]),
+        "feature_selection": feature_selection,
+        "n_features_selected": selected_feature_count(final_model),
         "cv_summary": cv_summary, "test_metrics": test_metrics,
         "test_prob_metrics_raw": metrics_raw, "test_prob_metrics_calibrated": metrics_cal,
     }, args.out)

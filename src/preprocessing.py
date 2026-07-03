@@ -1,16 +1,23 @@
 """Signal preprocessing and label harmonization.
 
 - map dataset-specific stage annotations to the shared 5-class space;
-- basic signal conditioning (bandpass filtering, resampling);
+- basic signal conditioning (bandpass filtering, resampling) on the continuous
+  recording, before epoching;
 - per-channel z-score normalization fit on TRAINING data only.
 
 The label mapping and normalization functions are implemented and tested,
 because they are the leakage-sensitive parts of the pipeline.
 """
 import numpy as np
-from scipy.signal import butter, filtfilt, resample
 
 from src.utils import STAGE_TO_INDEX
+
+# Default band-pass edges (Hz) and harmonized sampling rate (master plan:
+# Filtering and normalization). 0.3 Hz removes slow drift; 35 Hz keeps the
+# sleep-relevant EEG/EOG/EMG band while dropping high-frequency noise.
+DEFAULT_L_FREQ = 0.3
+DEFAULT_H_FREQ = 35.0
+DEFAULT_TARGET_SFREQ = 100.0
 
 # Raw annotation string -> 5-class index. Legacy N4 is merged into N3.
 RAW_LABEL_TO_INDEX = {
@@ -68,19 +75,28 @@ def stage_label_from_text(description):
     return None
 
 
-def bandpass_filter(signal, sfreq, l_freq=0.3, h_freq=35.0, order=4):
-    """Apply a zero-phase Butterworth bandpass filter along the last axis."""
-    nyquist = 0.5 * sfreq
-    b, a = butter(order, [l_freq / nyquist, h_freq / nyquist], btype="band")
-    return filtfilt(b, a, signal, axis=-1)
+def filter_and_resample_raw(raw, l_freq=DEFAULT_L_FREQ, h_freq=DEFAULT_H_FREQ,
+                            target_sfreq=DEFAULT_TARGET_SFREQ):
+    """Band-pass filter (and optionally resample) a continuous MNE Raw in place.
 
+    Filtering the whole recording BEFORE epoching avoids the edge artifacts that
+    per-epoch filtering would introduce at every 30 s boundary, and resampling to
+    a shared rate harmonizes datasets so cross-dataset models see epochs of the
+    same length (master plan: Filtering and normalization).
 
-def resample_signal(signal, sfreq, target_sfreq):
-    """Resample along the last axis to harmonize sampling rates across datasets."""
-    if sfreq == target_sfreq:
-        return signal
-    n_target = round(signal.shape[-1] * target_sfreq / sfreq)
-    return resample(signal, n_target, axis=-1)
+    Parameters
+    ----------
+    raw : mne.io.BaseRaw
+        Preloaded raw recording; modified in place and also returned.
+    l_freq, h_freq : float
+        Band-pass edges in Hz. `h_freq` must stay below the target Nyquist.
+    target_sfreq : float or None
+        Resample to this rate; if None or already equal, no resampling is done.
+    """
+    raw.filter(l_freq, h_freq, verbose=False)
+    if target_sfreq is not None and raw.info["sfreq"] != target_sfreq:
+        raw.resample(target_sfreq, verbose=False)
+    return raw
 
 
 def fit_normalizer(x_train):

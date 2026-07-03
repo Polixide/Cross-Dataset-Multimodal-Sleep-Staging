@@ -20,7 +20,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import mne
 import numpy as np
 
-from src.preprocessing import stage_label_from_text
+from src.preprocessing import (
+    DEFAULT_H_FREQ,
+    DEFAULT_L_FREQ,
+    DEFAULT_TARGET_SFREQ,
+    filter_and_resample_raw,
+    stage_label_from_text,
+)
 from src.utils import EPOCH_SECONDS, ensure_dir, get_logger
 
 logger = get_logger("prepare_hmc")
@@ -35,12 +41,16 @@ def find_scoring_file(signal_path, raw_dir):
     return matches[0] if matches else None
 
 
-def process_recording(signal_path, scoring_path, channels, target_sfreq):
-    """Return (epochs, labels) for one HMC signal + scoring pair."""
+def process_recording(signal_path, scoring_path, channels, target_sfreq,
+                      l_freq=DEFAULT_L_FREQ, h_freq=DEFAULT_H_FREQ):
+    """Return (epochs, labels) for one HMC signal + scoring pair.
+
+    The continuous recording is band-pass filtered and resampled to the
+    development sampling rate before epoching, matching the Sleep-EDF pipeline.
+    """
     raw = mne.io.read_raw_edf(signal_path, preload=True, verbose=False)
     raw.pick(channels)
-    if raw.info["sfreq"] != target_sfreq:
-        raw.resample(target_sfreq, verbose=False)
+    filter_and_resample_raw(raw, l_freq, h_freq, target_sfreq)
 
     annotations = mne.read_annotations(scoring_path)
     raw.set_annotations(annotations, emit_warning=False)
@@ -78,7 +88,9 @@ def main():
     parser.add_argument("--raw-dir", default="data/raw/hmc")
     parser.add_argument("--out", default="data/processed/hmc.npz")
     parser.add_argument("--channels", nargs="+", default=HMC_CHANNELS)
-    parser.add_argument("--target-sfreq", type=float, default=100.0,
+    parser.add_argument("--l-freq", type=float, default=DEFAULT_L_FREQ)
+    parser.add_argument("--h-freq", type=float, default=DEFAULT_H_FREQ)
+    parser.add_argument("--target-sfreq", type=float, default=DEFAULT_TARGET_SFREQ,
                         help="Resample HMC to match the development dataset.")
     args = parser.parse_args()
 
@@ -94,7 +106,8 @@ def main():
             logger.warning("No sleep-scoring file for %s, skipping.", signal_path.name)
             continue
 
-        x, y = process_recording(signal_path, scoring_path, args.channels, args.target_sfreq)
+        x, y = process_recording(signal_path, scoring_path, args.channels,
+                                 args.target_sfreq, args.l_freq, args.h_freq)
         subject = signal_path.stem  # one recording per subject in HMC
         all_x.append(x)
         all_y.append(y)
@@ -106,9 +119,9 @@ def main():
     subjects = np.concatenate(all_subjects)
 
     ensure_dir(Path(args.out).parent)
-    np.savez_compressed(args.out, x=x, y=y, subjects=subjects)
-    logger.info("Saved %d epochs from %d recordings to %s",
-                len(y), len(np.unique(subjects)), args.out)
+    np.savez_compressed(args.out, x=x, y=y, subjects=subjects, sfreq=args.target_sfreq)
+    logger.info("Saved %d epochs from %d recordings to %s (sfreq=%g Hz)",
+                len(y), len(np.unique(subjects)), args.out, args.target_sfreq)
 
 
 if __name__ == "__main__":

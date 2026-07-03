@@ -11,12 +11,10 @@ data/
 ├── raw/         # original downloads, one subfolder per dataset (untracked)
 │   ├── sleep_edf/
 │   ├── hmc/
-│   ├── shhs/
 │   └── dreamt/
 ├── processed/   # model-ready .npz files produced by scripts/prepare_*.py
 │   ├── sleep_edf.npz
-│   ├── hmc.npz
-│   └── shhs.npz
+│   └── hmc.npz
 └── splits/      # saved subject-wise split indices for reproducibility
 ```
 
@@ -29,9 +27,7 @@ original subfolder structure (e.g. `data/raw/hmc/recordings/...`).
   Needs the paired `*-PSG.edf` + `*-Hypnogram.edf` files.
 - **HMC** — PhysioNet (Haaglanden Medisch Centrum sleep staging database); open
   access, no agreement. Needs the `SNxxx.edf` + `SNxxx_sleepscoring.edf` pairs.
-  Good open external test set while SHHS access is pending.
-- **SHHS** — National Sleep Research Resource (NSRR); requires an approved
-  data-use agreement. Needs each `*.edf` + its NSRR `*-nsrr.xml`.
+  Used as the external test set.
 - **DREAMT** — PhysioNet (optional wearable extension; different modality, treated
   as future work).
 
@@ -43,7 +39,11 @@ Download each dataset from its official source, then place the raw files under
 Each `scripts/prepare_*.py` writes a single compressed `.npz` with three aligned
 arrays — `x` (epoch signals, shape `(n_epochs, n_channels, n_samples)`; or
 `(n_epochs, n_features)` for the feature-based pipeline), `y` (integer stage
-labels in `[0, 4]`), and `subjects` (subject id per epoch).
+labels in `[0, 4]`), and `subjects` (subject id per epoch) — plus a scalar
+`sfreq` (the sampling rate the signals were resampled to, in Hz). The prepare
+scripts band-pass filter (default 0.3–35 Hz) and resample (default 100 Hz) each
+continuous recording before epoching, so all datasets share one sampling rate;
+downstream feature extraction reads `sfreq` from the `.npz`.
 
 ## Rules
 
