@@ -42,11 +42,13 @@ def main():
     logger.info("External set: %d epochs from %d subjects.", len(dataset.y), dataset.n_subjects)
 
     # Extract the same features used in training if the external data is raw epochs.
+    # The DataFrame's column names match those the model was fitted on, so the
+    # frozen estimator aligns features by name across datasets.
     x = dataset.x
     if x.ndim == 3:
         sfreq = args.sfreq or dataset.sfreq or 100.0
         logger.info("Extracting features from raw external epochs (sfreq=%g Hz)...", sfreq)
-        x, _ = extract_features_dataset(x, sfreq)
+        x = extract_features_dataset(x, sfreq)
 
     y_pred = model.predict(x)
     metrics = compute_metrics(dataset.y, y_pred, labels=LABELS)

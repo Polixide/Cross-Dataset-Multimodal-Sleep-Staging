@@ -8,7 +8,9 @@ Produces the material that motivates (and documents) feature selection:
 Everything is computed on the TRAINING subjects only, so the analysis never sees
 validation/test data (master plan: Validation rules). Importance uses a Random
 Forest fit on the training split; permutation importance is measured on the
-validation split.
+validation split. The feature matrix is a labelled pandas DataFrame, so the
+correlation matrix, importance rankings and per-feature report are all indexed
+by feature name.
 
 Usage:
     python scripts/analyze_features.py --data data/processed/sleep_edf.npz
@@ -24,7 +26,7 @@ import matplotlib
 matplotlib.use("Agg")
 
 import matplotlib.pyplot as plt
-import numpy as np
+import pandas as pd
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.inspection import permutation_importance
 
@@ -36,10 +38,11 @@ from src.utils import SLEEP_EDF_CHANNELS, ensure_dir, get_logger, save_json
 logger = get_logger("analyze_features")
 
 
-def plot_correlation_matrix(corr, feature_names, out_path):
-    """Heatmap of the absolute feature-feature correlation matrix."""
+def plot_correlation_matrix(corr, out_path):
+    """Heatmap of the absolute feature-feature correlation matrix (a DataFrame)."""
+    feature_names = list(corr.columns)
     fig, ax = plt.subplots(figsize=(9, 8))
-    image = ax.imshow(np.abs(corr), cmap="viridis", vmin=0.0, vmax=1.0, aspect="auto")
+    image = ax.imshow(corr.abs().to_numpy(), cmap="viridis", vmin=0.0, vmax=1.0, aspect="auto")
     ax.set_title(f"Absolute feature correlation ({len(feature_names)} features)")
     # Sparse ticks: too many features to label individually.
     step = max(1, len(feature_names) // 12)
@@ -54,12 +57,15 @@ def plot_correlation_matrix(corr, feature_names, out_path):
     plt.close(fig)
 
 
-def plot_importance(importances, feature_names, title, out_path, top_k=20, errors=None):
-    """Horizontal bar chart of the top-k most important features."""
-    order = np.argsort(importances)[-top_k:]
-    fig, ax = plt.subplots(figsize=(8, max(4, 0.32 * len(order))))
-    ax.barh([feature_names[i] for i in order], importances[order],
-            xerr=None if errors is None else errors[order])
+def plot_importance(importances, title, out_path, top_k=20, errors=None):
+    """Horizontal bar chart of the top-k features (importances is a pandas Series).
+
+    ``errors`` is an optional Series of matching error bars (aligned by name).
+    """
+    top = importances.sort_values().tail(top_k)
+    xerr = None if errors is None else errors.reindex(top.index).to_numpy()
+    fig, ax = plt.subplots(figsize=(8, max(4, 0.32 * len(top))))
+    ax.barh(top.index.tolist(), top.to_numpy(), xerr=xerr)
     ax.set_xlabel("Importance")
     ax.set_title(title)
     fig.tight_layout()
@@ -85,49 +91,64 @@ def main():
     sfreq = args.sfreq or dataset.sfreq or 100.0
 
     logger.info("Extracting features from %d epochs (sfreq=%g Hz)...", len(dataset.y), sfreq)
-    features, feature_names = extract_features_dataset(dataset.x, sfreq, args.channels)
+    features = extract_features_dataset(dataset.x, sfreq, args.channels)
+    feature_names = list(features.columns)
 
     # Use training subjects only for every statistic below (leakage-safe).
     train_idx, val_idx, _ = subject_wise_split(dataset.subjects)
-    x_train, y_train = features[train_idx], dataset.y[train_idx]
-    x_val, y_val = features[val_idx], dataset.y[val_idx]
+    x_train, y_train = features.iloc[train_idx], dataset.y[train_idx]
+    x_val, y_val = features.iloc[val_idx], dataset.y[val_idx]
     logger.info("Analysis on %d training + %d validation epochs.", len(train_idx), len(val_idx))
 
     out_dir = ensure_dir(args.out_dir)
 
     # 1. Correlation matrix (redundancy structure).
-    corr = np.nan_to_num(np.corrcoef(x_train, rowvar=False))
-    plot_correlation_matrix(corr, feature_names, out_dir / "feature_correlation_matrix.png")
+    corr = x_train.corr().fillna(0.0)
+    plot_correlation_matrix(corr, out_dir / "feature_correlation_matrix.png")
 
     # 2. Importance: RF impurity (train) + permutation (validation).
     forest = RandomForestClassifier(
         n_estimators=300, class_weight="balanced", n_jobs=-1, random_state=42
     ).fit(x_train, y_train)
-    plot_importance(forest.feature_importances_, feature_names,
-                    "Random-Forest impurity importance",
+    impurity = pd.Series(forest.feature_importances_, index=feature_names)
+    plot_importance(impurity, "Random-Forest impurity importance",
                     out_dir / "feature_importance_impurity.png", args.top_k)
 
     perm = permutation_importance(forest, x_val, y_val, n_repeats=10,
                                   random_state=42, scoring="f1_macro", n_jobs=-1)
-    plot_importance(perm.importances_mean, feature_names,
-                    "Permutation importance (validation, macro-F1 drop)",
-                    out_dir / "feature_importance_permutation.png", args.top_k,
-                    errors=perm.importances_std)
+    perm_mean = pd.Series(perm.importances_mean, index=feature_names)
+    perm_std = pd.Series(perm.importances_std, index=feature_names)
+    plot_importance(perm_mean, "Permutation importance (validation, macro-F1 drop)",
+                    out_dir / "feature_importance_permutation.png", args.top_k, errors=perm_std)
 
     # 3. Correlation-pruning preview (what feature selection would keep).
-    kept, dropped = correlation_pruned_indices(x_train, threshold=args.corr_threshold)
+    kept, dropped = correlation_pruned_indices(x_train.to_numpy(), threshold=args.corr_threshold)
+    kept_names = [feature_names[i] for i in kept]
+    dropped_names = [feature_names[i] for i in dropped]
     logger.info("Correlation pruning (|r|>%.2f): keep %d / drop %d of %d features.",
                 args.corr_threshold, len(kept), len(dropped), len(feature_names))
 
-    ranking = np.argsort(forest.feature_importances_)[::-1]
+    # Tidy per-feature report, ranked by impurity importance -> CSV (+ JSON summary).
+    kept_set = set(kept_names)
+    report = pd.DataFrame({
+        "feature": feature_names,
+        "impurity_importance": forest.feature_importances_,
+        "perm_importance_mean": perm.importances_mean,
+        "perm_importance_std": perm.importances_std,
+        "kept_by_pruning": [name in kept_set for name in feature_names],
+    }).sort_values("impurity_importance", ascending=False, ignore_index=True)
+    csv_path = Path(args.table_out).with_suffix(".csv")
+    ensure_dir(csv_path.parent)
+    report.to_csv(csv_path, index=False)
+
     save_json({
         "n_features": len(feature_names),
         "corr_threshold": args.corr_threshold,
-        "kept_features": [feature_names[i] for i in kept],
-        "dropped_features": [feature_names[i] for i in dropped],
-        "impurity_importance_ranking": [feature_names[i] for i in ranking],
+        "kept_features": kept_names,
+        "dropped_features": dropped_names,
+        "impurity_importance_ranking": report["feature"].tolist(),
     }, args.table_out)
-    logger.info("Saved figures to %s and feature report to %s", out_dir, args.table_out)
+    logger.info("Saved figures to %s, feature report to %s and %s", out_dir, args.table_out, csv_path)
 
 
 if __name__ == "__main__":

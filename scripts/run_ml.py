@@ -17,6 +17,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import numpy as np
+import pandas as pd
+from tqdm.auto import tqdm
 
 from src.data_loader import leave_one_subject_out, load_processed_dataset, subject_wise_split
 from src.evaluate import compute_metrics, probabilistic_metrics, summarize_folds
@@ -30,15 +32,18 @@ LABELS = list(range(len(STAGE_NAMES)))
 
 
 def get_feature_matrix(dataset, sfreq):
-    """Return (feature_matrix, feature_names), extracting features if data is raw epochs.
+    """Return the feature matrix as a DataFrame, extracting it if data is raw epochs.
 
-    feature_names is None when the dataset is already a 2D feature matrix.
+    The named columns flow into the fitted estimator (``feature_names_in_``) so
+    SHAP and reporting can label features without a separate name list. A dataset
+    that is already a 2D feature matrix is wrapped with generic column names.
     """
     if dataset.x.ndim == 3:
         logger.info("Extracting features from raw epochs (%d epochs, sfreq=%g Hz)...",
                     len(dataset.y), sfreq)
         return extract_features_dataset(dataset.x, sfreq)
-    return dataset.x, None
+    x = np.asarray(dataset.x)
+    return pd.DataFrame(x, columns=[f"feature_{i}" for i in range(x.shape[1])])
 
 
 def selected_feature_count(fitted_model):
@@ -56,10 +61,11 @@ def selected_feature_count(fitted_model):
 def run_loso(x, y, subjects, model, balance, feature_selection, out_path):
     """Leave-one-subject-out robustness analysis (secondary)."""
     y_true, y_pred = [], []
-    for train_idx, test_idx in leave_one_subject_out(subjects):
+    folds = leave_one_subject_out(subjects)
+    for train_idx, test_idx in tqdm(folds, desc="LOSO", unit="subject"):
         estimator = build_estimator(model, balance, feature_selection=feature_selection)
-        estimator.fit(x[train_idx], y[train_idx])
-        y_pred.append(estimator.predict(x[test_idx]))
+        estimator.fit(x.iloc[train_idx], y[train_idx])
+        y_pred.append(estimator.predict(x.iloc[test_idx]))
         y_true.append(y[test_idx])
     metrics = compute_metrics(np.concatenate(y_true), np.concatenate(y_pred), labels=LABELS)
     save_json({"model": model, "balance": balance, "loso_metrics": metrics}, out_path)
@@ -91,7 +97,8 @@ def main():
     set_seed()
     dataset = load_processed_dataset(args.data)
     sfreq = args.sfreq or dataset.sfreq or 100.0
-    x, feature_names = get_feature_matrix(dataset, sfreq)
+    x = get_feature_matrix(dataset, sfreq)
+    feature_names = list(x.columns)
     y, subjects = dataset.y, dataset.subjects
     logger.info("Loaded %d epochs from %d subjects (%d features).",
                 len(y), dataset.n_subjects, x.shape[1])
@@ -115,7 +122,7 @@ def main():
     n_splits = min(args.folds, len(np.unique(subjects[dev_idx])))
     cv_metrics = cross_validate_ml(
         lambda: build_estimator(args.model, args.balance, feature_selection=feature_selection),
-        x[dev_idx], y[dev_idx], subjects[dev_idx], n_splits=n_splits, labels=LABELS,
+        x.iloc[dev_idx], y[dev_idx], subjects[dev_idx], n_splits=n_splits, labels=LABELS,
     )
     cv_summary = summarize_folds(cv_metrics)
     logger.info("CV macro-F1: %.3f +/- %.3f",
@@ -127,19 +134,19 @@ def main():
         tune_splits = min(args.folds, len(np.unique(subjects[train_idx])))
         final_model, best_params, best_score = tune_ml(
             build_estimator(args.model, args.balance, feature_selection=feature_selection),
-            args.model, x[train_idx], y[train_idx], subjects[train_idx], n_splits=tune_splits,
+            args.model, x.iloc[train_idx], y[train_idx], subjects[train_idx], n_splits=tune_splits,
         )
         logger.info("Best params: %s (CV macro-F1 %.3f)", best_params, best_score)
     else:
         final_model = build_estimator(args.model, args.balance, feature_selection=feature_selection)
-        final_model.fit(x[train_idx], y[train_idx])
+        final_model.fit(x.iloc[train_idx], y[train_idx])
 
     # Calibrate on the validation subjects only, then evaluate on the held-out test.
-    calibrated = calibrate_classifier(final_model, x[val_idx], y[val_idx])
-    y_pred = calibrated.predict(x[test_idx])
+    calibrated = calibrate_classifier(final_model, x.iloc[val_idx], y[val_idx])
+    y_pred = calibrated.predict(x.iloc[test_idx])
     test_metrics = compute_metrics(y[test_idx], y_pred, labels=LABELS)
-    prob_raw = final_model.predict_proba(x[test_idx])
-    prob_cal = calibrated.predict_proba(x[test_idx])
+    prob_raw = final_model.predict_proba(x.iloc[test_idx])
+    prob_cal = calibrated.predict_proba(x.iloc[test_idx])
     metrics_raw = probabilistic_metrics(y[test_idx], prob_raw)
     metrics_cal = probabilistic_metrics(y[test_idx], prob_cal)
     logger.info("Test macro-F1: %.3f | ECE raw %.3f -> calibrated %.3f",
@@ -150,7 +157,7 @@ def main():
     np.savez_compressed(args.probs_out, y_true=y[test_idx], y_prob=prob_cal, y_prob_raw=prob_raw)
     save_json({
         "model": args.model, "balance": args.balance, "tuned": args.tune, "best_params": best_params,
-        "sfreq": sfreq, "n_features_total": int(x.shape[1]),
+        "sfreq": sfreq, "n_features_total": int(x.shape[1]), "feature_names": feature_names,
         "feature_selection": feature_selection,
         "n_features_selected": selected_feature_count(final_model),
         "cv_summary": cv_summary, "test_metrics": test_metrics,

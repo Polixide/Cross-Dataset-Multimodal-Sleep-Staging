@@ -1,13 +1,26 @@
-"""Dataset loading and SUBJECT-WISE splitting.
+"""Dataset loading, streaming save, and SUBJECT-WISE splitting.
 
 This module is the single source of truth for how data is partitioned. All
 splits are subject-wise to prevent subject leakage, the central methodological
 rule of the project.
+
+It also owns the on-disk format of the processed datasets. Because Sleep-EDF
+expands to hundreds of thousands of epochs (tens of GB as one float array), the
+signals are stored as a standalone memory-mappable ``.npy`` next to a small
+``.npz`` holding the labels/subjects/metadata. `EpochStreamWriter` fills that
+``.npy`` one recording at a time (peak RAM stays around a single recording) and
+`load_processed_dataset` memory-maps it back, so no stage of the pipeline needs
+the whole dataset resident in RAM.
 """
+import shutil
+import tempfile
 from dataclasses import dataclass
+from pathlib import Path
 
 import numpy as np
 from sklearn.model_selection import GroupKFold
+
+from src.utils import ensure_dir
 
 
 @dataclass
@@ -36,11 +49,91 @@ class EpochDataset:
         return len(np.unique(self.subjects))
 
 
-def load_processed_dataset(path):
-    """Load a preprocessed dataset saved as a single .npz with x, y, subjects[, sfreq]."""
+def load_processed_dataset(path, mmap=True):
+    """Load a preprocessed dataset written by the prepare_*.py scripts.
+
+    Two on-disk layouts are supported:
+
+    - streaming layout (current): the .npz holds y/subjects/sfreq and an
+      ``x_path`` pointing at a sibling ``*_x.npy``; the signals are memory-mapped
+      (``mmap=True``) so they are never fully loaded into RAM.
+    - legacy layout: a single .npz that also contains ``x`` inline.
+    """
+    path = Path(path)
     data = np.load(path, allow_pickle=True)
     sfreq = float(data["sfreq"]) if "sfreq" in data.files else None
-    return EpochDataset(x=data["x"], y=data["y"], subjects=data["subjects"], sfreq=sfreq)
+    if "x" in data.files:
+        x = data["x"]
+    else:
+        x_path = path.parent / str(data["x_path"])
+        x = np.load(x_path, mmap_mode="r" if mmap else None)
+    return EpochDataset(x=x, y=data["y"], subjects=data["subjects"], sfreq=sfreq)
+
+
+class EpochStreamWriter:
+    """Persist epochs recording-by-recording so peak RAM stays ~one recording.
+
+    Each `add` writes that recording's signals to a temporary ``.npy`` shard and
+    keeps only the (tiny) labels and subject ids in memory. `finalize` assembles
+    the shards into a single memory-mapped ``*_x.npy`` next to the ``.npz``
+    metadata file. This avoids ever holding the whole dataset in RAM, which for
+    the ~450k Sleep-EDF epochs would be tens of GB.
+
+    Signals are stored as float32 (half the size of MNE's float64) — ample
+    precision for filtered, z-scored biosignals.
+    """
+
+    def __init__(self, out_path, dtype=np.float32):
+        self.out_path = Path(out_path)
+        self.dtype = dtype
+        self.x_path = self.out_path.with_name(self.out_path.stem + "_x.npy")
+        ensure_dir(self.out_path.parent)
+        self._tmpdir = Path(tempfile.mkdtemp(prefix="epochs_", dir=self.out_path.parent))
+        self._shards = []            # list of (shard_path, n_rows)
+        self._y = []
+        self._subjects = []
+        self._sample_shape = None    # (n_channels, n_samples)
+
+    def add(self, x, y, subjects):
+        """Append one recording's epochs; only labels/ids stay in memory."""
+        x = np.asarray(x, dtype=self.dtype)
+        if self._sample_shape is None:
+            self._sample_shape = x.shape[1:]
+        elif x.shape[1:] != self._sample_shape:
+            raise ValueError(f"Inconsistent epoch shape {x.shape[1:]} vs {self._sample_shape}.")
+        shard = self._tmpdir / f"shard_{len(self._shards):04d}.npy"
+        np.save(shard, x)
+        self._shards.append((shard, len(x)))
+        self._y.append(np.asarray(y))
+        self._subjects.append(np.asarray(subjects))
+
+    def finalize(self, sfreq):
+        """Assemble shards into the memmapped .npy + metadata .npz.
+
+        Returns (n_epochs, n_subjects).
+        """
+        if not self._shards:
+            shutil.rmtree(self._tmpdir, ignore_errors=True)
+            raise RuntimeError("No epochs were added before finalize().")
+
+        total = sum(n for _, n in self._shards)
+        x_mm = np.lib.format.open_memmap(
+            self.x_path, mode="w+", dtype=self.dtype, shape=(total, *self._sample_shape)
+        )
+        start = 0
+        for shard, n in self._shards:
+            x_mm[start:start + n] = np.load(shard)
+            start += n
+            shard.unlink()
+        x_mm.flush()
+        del x_mm
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
+
+        y = np.concatenate(self._y)
+        subjects = np.concatenate(self._subjects)
+        np.savez_compressed(self.out_path, y=y, subjects=subjects, sfreq=sfreq,
+                            x_path=self.x_path.name)
+        return total, int(len(np.unique(subjects)))
 
 
 def check_no_subject_overlap(*subject_groups):

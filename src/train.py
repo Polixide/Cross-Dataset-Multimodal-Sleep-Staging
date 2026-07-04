@@ -11,6 +11,7 @@ an extra dependency; it can be swapped for optuna without changing the callers.
 import numpy as np
 import torch
 from scipy.optimize import minimize_scalar
+from tqdm.auto import tqdm
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.frozen import FrozenEstimator
 from sklearn.model_selection import GridSearchCV, GroupKFold
@@ -31,6 +32,16 @@ ML_PARAM_GRIDS = {
 
 # --- Machine learning -------------------------------------------------------
 
+def _take_rows(x, idx):
+    """Row-subset ``x`` by integer positions for numpy arrays or DataFrames.
+
+    Feature matrices are now pandas DataFrames (positional ``.iloc``) while the
+    tests and legacy callers still pass numpy arrays (positional ``[]``); this
+    keeps the CV loop agnostic to which one it received.
+    """
+    return x.iloc[idx] if hasattr(x, "iloc") else x[idx]
+
+
 def compute_class_weights(y):
     """Inverse-frequency class weights (mean-normalized) for weighted losses."""
     y = np.asarray(y)
@@ -46,10 +57,11 @@ def cross_validate_ml(model_builder, x, y, subjects, n_splits=5, labels=None):
     each fold trains an independent model. Returns a list of per-fold metric dicts.
     """
     fold_metrics = []
-    for train_idx, val_idx in subject_wise_folds(subjects, n_splits=n_splits):
+    folds = subject_wise_folds(subjects, n_splits=n_splits)
+    for train_idx, val_idx in tqdm(folds, desc="CV folds", unit="fold"):
         model = model_builder()
-        model.fit(x[train_idx], y[train_idx])
-        y_pred = model.predict(x[val_idx])
+        model.fit(_take_rows(x, train_idx), y[train_idx])
+        y_pred = model.predict(_take_rows(x, val_idx))
         fold_metrics.append(compute_metrics(y[val_idx], y_pred, labels=labels))
     return fold_metrics
 
@@ -130,7 +142,7 @@ def predict_logits_dl(model, loader, device="cpu"):
     model.eval()
     y_true, logits = [], []
     with torch.no_grad():
-        for x_batch, y_batch in loader:
+        for x_batch, y_batch in tqdm(loader, desc="Predicting", unit="batch", leave=False):
             batch_logits = model(x_batch.to(device))
             logits.append(batch_logits.reshape(-1, batch_logits.shape[-1]).cpu().numpy())
             y_true.append(y_batch.reshape(-1).numpy())
@@ -154,10 +166,12 @@ def train_dl(model, train_loader, val_loader, epochs=20, lr=1e-3,
     history = []
     best_macro_f1 = -1.0
     best_state = None
-    for epoch in range(epochs):
+    epoch_bar = tqdm(range(epochs), desc="Training", unit="epoch")
+    for epoch in epoch_bar:
         model.train()
         epoch_loss = 0.0
-        for x_batch, y_batch in train_loader:
+        batch_bar = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{epochs}", unit="batch", leave=False)
+        for x_batch, y_batch in batch_bar:
             x_batch, y_batch = x_batch.to(device), y_batch.to(device)
             optimizer.zero_grad()
             logits = model(x_batch)
@@ -166,6 +180,7 @@ def train_dl(model, train_loader, val_loader, epochs=20, lr=1e-3,
             loss.backward()
             optimizer.step()
             epoch_loss += loss.item()
+            batch_bar.set_postfix(loss=f"{loss.item():.3f}")
 
         val_metrics = evaluate_dl(model, val_loader, device)
         history.append({
@@ -173,6 +188,8 @@ def train_dl(model, train_loader, val_loader, epochs=20, lr=1e-3,
             "train_loss": epoch_loss / len(train_loader),
             "val_macro_f1": val_metrics["macro_f1"],
         })
+        epoch_bar.set_postfix(train_loss=f"{epoch_loss / len(train_loader):.3f}",
+                              val_f1=f"{val_metrics['macro_f1']:.3f}")
         if val_metrics["macro_f1"] > best_macro_f1:
             best_macro_f1 = val_metrics["macro_f1"]
             best_state = {name: tensor.cpu().clone() for name, tensor in model.state_dict().items()}
@@ -192,7 +209,7 @@ def random_search_dl(model_factory, train_loader, val_loader, n_trials=6, epochs
     rng = np.random.default_rng(seed)
     learning_rates = [1e-2, 3e-3, 1e-3, 3e-4]
     best, trials = None, []
-    for _ in range(n_trials):
+    for _ in tqdm(range(n_trials), desc="Random search", unit="trial"):
         lr = float(rng.choice(learning_rates))
         use_focal = bool(rng.integers(0, 2))
         model, history = train_dl(model_factory(), train_loader, val_loader,

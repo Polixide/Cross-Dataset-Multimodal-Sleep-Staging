@@ -64,6 +64,9 @@ pip install -r requirements.txt
 Prepare data, then run a baseline:
 
 ```bash
+# 0. Unpack the PhysioNet ZIP downloads placed in data/raw/ into data/raw/<dataset>/
+python scripts/extract_data.py
+
 # 1. Build model-ready epochs (see scripts for arguments)
 python scripts/prepare_sleep_edf.py --raw-dir data/raw/sleep_edf --out data/processed/sleep_edf.npz
 

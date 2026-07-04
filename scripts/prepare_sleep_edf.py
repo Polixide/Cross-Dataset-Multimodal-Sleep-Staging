@@ -20,7 +20,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import mne
 import numpy as np
+from tqdm.auto import tqdm
 
+from src.data_loader import EpochStreamWriter
 from src.preprocessing import (
     DEFAULT_H_FREQ,
     DEFAULT_L_FREQ,
@@ -28,7 +30,7 @@ from src.preprocessing import (
     RAW_LABEL_TO_INDEX,
     filter_and_resample_raw,
 )
-from src.utils import EPOCH_SECONDS, SLEEP_EDF_CHANNELS, ensure_dir, get_logger
+from src.utils import EPOCH_SECONDS, SLEEP_EDF_CHANNELS, get_logger
 
 logger = get_logger("prepare_sleep_edf")
 
@@ -53,12 +55,15 @@ def process_recording(psg_path, hypnogram_path, channels,
     raw.set_annotations(annotations, emit_warning=False)
 
     # chunk_duration splits each stage annotation into consecutive 30 s events.
-    events, _ = mne.events_from_annotations(
+    # events_from_annotations returns only the stages actually present in this
+    # recording; passing that subset (not the full 6-stage map) to Epochs avoids
+    # a "No matching events" error when a night lacks a stage, e.g. legacy N4.
+    events, present_event_id = mne.events_from_annotations(
         raw, event_id=ANNOTATION_TO_CODE, chunk_duration=float(EPOCH_SECONDS), verbose=False
     )
     tmax = EPOCH_SECONDS - 1.0 / raw.info["sfreq"]
     epochs = mne.Epochs(
-        raw, events, event_id=ANNOTATION_TO_CODE, tmin=0.0, tmax=tmax,
+        raw, events, event_id=present_event_id, tmin=0.0, tmax=tmax,
         baseline=None, preload=True, verbose=False,
     )
 
@@ -83,8 +88,10 @@ def main():
     if not psg_files:
         raise FileNotFoundError(f"No *-PSG.edf files found in {raw_dir}.")
 
-    all_x, all_y, all_subjects = [], [], []
-    for psg_path in psg_files:
+    # Stream each recording straight to disk instead of accumulating every epoch
+    # in RAM (Sleep-EDF is ~450k epochs / tens of GB): peak memory stays ~one night.
+    writer = EpochStreamWriter(args.out)
+    for psg_path in tqdm(psg_files, desc="Sleep-EDF recordings", unit="rec"):
         recording_id = psg_path.name[:6]
         hypnograms = sorted(raw_dir.rglob(f"{recording_id}*-Hypnogram.edf"))
         if not hypnograms:
@@ -93,20 +100,16 @@ def main():
 
         x, y = process_recording(psg_path, hypnograms[0], args.channels,
                                  args.l_freq, args.h_freq, args.target_sfreq)
-        subject = psg_path.name[3:5]  # night-independent subject id
-        all_x.append(x)
-        all_y.append(y)
-        all_subjects.append(np.full(len(y), subject))
+        # Prefix with the study code (SC/ST): sleep-cassette and sleep-telemetry
+        # reuse the same 2-digit numbers for DIFFERENT people, so without this the
+        # two cohorts collide into one id and subject-wise splitting breaks.
+        subject = psg_path.name[:2] + psg_path.name[3:5]  # e.g. "SC00", "ST01"
+        writer.add(x, y, np.full(len(y), subject))
         logger.info("Processed %s: %d epochs (subject %s).", psg_path.name, len(y), subject)
 
-    x = np.concatenate(all_x)
-    y = np.concatenate(all_y)
-    subjects = np.concatenate(all_subjects)
-
-    ensure_dir(Path(args.out).parent)
-    np.savez_compressed(args.out, x=x, y=y, subjects=subjects, sfreq=args.target_sfreq)
-    logger.info("Saved %d epochs from %d subjects to %s (sfreq=%g Hz)",
-                len(y), len(np.unique(subjects)), args.out, args.target_sfreq)
+    n_epochs, n_subjects = writer.finalize(args.target_sfreq)
+    logger.info("Saved %d epochs from %d subjects to %s (signals in %s, sfreq=%g Hz)",
+                n_epochs, n_subjects, args.out, writer.x_path.name, args.target_sfreq)
 
 
 if __name__ == "__main__":

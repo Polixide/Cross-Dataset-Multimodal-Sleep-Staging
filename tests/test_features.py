@@ -1,17 +1,19 @@
 """Tests for feature extraction."""
 import numpy as np
+import pandas as pd
 
 from src.features import extract_epoch_features, extract_features_dataset
 
 
-def test_extract_features_dataset_returns_2d_matrix():
+def test_extract_features_dataset_returns_named_dataframe():
     rng = np.random.default_rng(0)
     x = rng.normal(size=(6, 4, 300))  # 6 epochs, 4 channels, 300 samples
-    features, names = extract_features_dataset(x, sfreq=100.0)
-    assert features.ndim == 2
+    features = extract_features_dataset(x, sfreq=100.0)
+    assert isinstance(features, pd.DataFrame)
     assert features.shape[0] == 6
-    assert features.shape[1] == len(names)
-    assert np.isfinite(features).all()
+    assert features.shape[1] == len(features.columns)
+    assert list(features.columns) == list(dict.fromkeys(features.columns))  # unique names
+    assert np.isfinite(features.to_numpy()).all()
 
 
 def test_feature_names_are_prefixed_per_channel():

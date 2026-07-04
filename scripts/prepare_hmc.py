@@ -19,7 +19,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import mne
 import numpy as np
+from tqdm.auto import tqdm
 
+from src.data_loader import EpochStreamWriter
 from src.preprocessing import (
     DEFAULT_H_FREQ,
     DEFAULT_L_FREQ,
@@ -27,7 +29,7 @@ from src.preprocessing import (
     filter_and_resample_raw,
     stage_label_from_text,
 )
-from src.utils import EPOCH_SECONDS, ensure_dir, get_logger
+from src.utils import EPOCH_SECONDS, get_logger
 
 logger = get_logger("prepare_hmc")
 
@@ -99,8 +101,10 @@ def main():
     if not signal_files:
         raise FileNotFoundError(f"No signal .edf files found in {raw_dir}.")
 
-    all_x, all_y, all_subjects = [], [], []
-    for signal_path in signal_files:
+    # Stream each recording straight to disk (see prepare_sleep_edf): peak memory
+    # stays around one recording instead of the whole dataset.
+    writer = EpochStreamWriter(args.out)
+    for signal_path in tqdm(signal_files, desc="HMC recordings", unit="rec"):
         scoring_path = find_scoring_file(signal_path, raw_dir)
         if scoring_path is None:
             logger.warning("No sleep-scoring file for %s, skipping.", signal_path.name)
@@ -109,19 +113,12 @@ def main():
         x, y = process_recording(signal_path, scoring_path, args.channels,
                                  args.target_sfreq, args.l_freq, args.h_freq)
         subject = signal_path.stem  # one recording per subject in HMC
-        all_x.append(x)
-        all_y.append(y)
-        all_subjects.append(np.full(len(y), subject))
+        writer.add(x, y, np.full(len(y), subject))
         logger.info("Processed %s: %d epochs.", signal_path.name, len(y))
 
-    x = np.concatenate(all_x)
-    y = np.concatenate(all_y)
-    subjects = np.concatenate(all_subjects)
-
-    ensure_dir(Path(args.out).parent)
-    np.savez_compressed(args.out, x=x, y=y, subjects=subjects, sfreq=args.target_sfreq)
-    logger.info("Saved %d epochs from %d recordings to %s (sfreq=%g Hz)",
-                len(y), len(np.unique(subjects)), args.out, args.target_sfreq)
+    n_epochs, n_subjects = writer.finalize(args.target_sfreq)
+    logger.info("Saved %d epochs from %d recordings to %s (signals in %s, sfreq=%g Hz)",
+                n_epochs, n_subjects, args.out, writer.x_path.name, args.target_sfreq)
 
 
 if __name__ == "__main__":

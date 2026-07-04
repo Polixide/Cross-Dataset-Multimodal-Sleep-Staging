@@ -1,11 +1,13 @@
 """Feature extraction for the feature-based ML pipeline.
 
 Organized by the domains from the master plan: time, frequency, nonlinear and
-time-frequency. `extract_features_dataset` turns a raw epoch array into the 2D
-feature matrix the ML models consume.
+time-frequency. `extract_features_dataset` turns a raw epoch array into the
+labelled feature DataFrame the ML models consume.
 """
 import numpy as np
+import pandas as pd
 from scipy.signal import stft, welch
+from tqdm.auto import tqdm
 
 # Standard EEG frequency bands in Hz.
 FREQ_BANDS = {
@@ -128,18 +130,24 @@ def extract_epoch_features(epoch, sfreq, channel_names=None):
     return features
 
 
-def extract_features_dataset(x, sfreq, channel_names=None):
-    """Turn a raw epoch array into a 2D feature matrix for the ML models.
+def extract_features_dataset(x, sfreq, channel_names=None, progress=True):
+    """Turn a raw epoch array into a labelled feature DataFrame for the ML models.
 
-    x has shape (n_epochs, n_channels, n_samples).
-    Returns (features, feature_names): features is (n_epochs, n_features).
+    x has shape (n_epochs, n_channels, n_samples). Returns a
+    ``pandas.DataFrame`` of shape (n_epochs, n_features) whose columns are the
+    ``<channel>_<feature>`` names. Keeping the names attached to the data lets
+    them flow into the fitted estimator (``feature_names_in_``) and downstream
+    SHAP/analysis without threading a separate name list around. Set
+    ``progress=False`` to silence the tqdm progress bar.
     """
     x = np.asarray(x)
     rows = []
     feature_names = None
-    for epoch in x:
+    for epoch in tqdm(x, desc="Extracting features", unit="epoch", disable=not progress):
         epoch_features = extract_epoch_features(epoch, sfreq, channel_names)
         if feature_names is None:
             feature_names = list(epoch_features)
         rows.append([epoch_features[name] for name in feature_names])
-    return np.array(rows, dtype=float), feature_names
+    if feature_names is None:  # no epochs
+        return pd.DataFrame()
+    return pd.DataFrame(np.asarray(rows, dtype=float), columns=feature_names)
