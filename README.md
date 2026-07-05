@@ -111,6 +111,10 @@ The full pipeline is implemented and tested:
 - **Temporal context:** `--context N` turns any DL model into a hierarchical
   sequence model over N neighboring epochs (one label per epoch), with the
   single-epoch models kept as the with/without-context baseline.
+- **Memory:** the DL runner streams training statistics off the memmap
+  (`fit_normalizer_streaming`) and reads epochs lazily per item
+  (`MemmapEpochDataset`), so it trains on the full Sleep-EDF set (~22 GB of
+  signals) without loading it into RAM.
 - **Imbalance:** class weights, SMOTE / random oversampling (ML), focal loss and
   balanced mini-batches (DL).
 - **Tuning:** grid search (ML) and random search (DL), both subject-wise.

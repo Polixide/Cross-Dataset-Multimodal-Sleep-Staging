@@ -15,7 +15,7 @@ from tqdm.auto import tqdm
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.frozen import FrozenEstimator
 from sklearn.model_selection import GridSearchCV, GroupKFold
-from torch.utils.data import DataLoader, TensorDataset, WeightedRandomSampler
+from torch.utils.data import DataLoader, Dataset, TensorDataset, WeightedRandomSampler
 
 from src.data_loader import subject_wise_folds
 from src.evaluate import compute_metrics
@@ -95,7 +95,11 @@ def calibrate_classifier(fitted_estimator, x_val, y_val, method="isotonic"):
 # --- Deep learning ----------------------------------------------------------
 
 def make_dataloader(x, y, batch_size=64, shuffle=False, balanced=False):
-    """Wrap epoch arrays (x, y) in a torch DataLoader.
+    """Wrap in-memory epoch arrays (x, y) in a torch DataLoader.
+
+    Loads the whole array into a tensor, so it is only for data that fits in RAM
+    (tests, small subsets). For the full memmapped dataset use
+    ``MemmapEpochDataset`` + ``make_lazy_dataloader`` instead.
 
     balanced=True draws class-balanced mini-batches with a WeightedRandomSampler.
     """
@@ -112,6 +116,70 @@ def make_dataloader(x, y, batch_size=64, shuffle=False, balanced=False):
         )
         return DataLoader(dataset, batch_size=batch_size, sampler=sampler)
     return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle)
+
+
+class MemmapEpochDataset(Dataset):
+    """Read epochs lazily from a memmapped array and z-score them per item.
+
+    Only the item indices and the tiny normalizer live in RAM; each ``__getitem__``
+    reads one epoch (or one sequence of epochs) straight from the memmap and
+    normalizes it on the fly. This is the standard out-of-core pattern for torch
+    datasets and is what keeps peak RAM at ~one mini-batch, so the full Sleep-EDF
+    signal array (tens of GB) never needs to be resident.
+
+    context == 1 -> item i is one epoch:      x (C, T),          y scalar
+    context  > 1 -> item i is one sequence:   x (seq_len, C, T), y (seq_len,)
+
+    Parameters
+    ----------
+    x : memmap/array of shape (n_epochs, n_channels, n_samples).
+    y : integer labels for the whole dataset (n_epochs,).
+    item_index : per-item indices into ``x``. Shape (n_items,) when context == 1,
+        or (n_items, seq_len) of global indices when context > 1 (from
+        ``build_sequence_windows``).
+    mean, std : normalizer from ``fit_normalizer_streaming`` (shape (1, C, 1)).
+    """
+
+    def __init__(self, x, y, item_index, mean, std, context=1):
+        self.x = x
+        self.y = np.asarray(y)
+        self.item_index = np.asarray(item_index)
+        self.context = context
+        self._mean = np.asarray(mean, dtype=np.float32).reshape(-1)  # (C,)
+        self._std = np.asarray(std, dtype=np.float32).reshape(-1)
+
+    def __len__(self):
+        return len(self.item_index)
+
+    @property
+    def labels(self):
+        """Flattened per-epoch labels of every item (for class weights / sampling)."""
+        return self.y[self.item_index].reshape(-1)
+
+    def __getitem__(self, i):
+        gidx = self.item_index[i]
+        signals = np.asarray(self.x[gidx], dtype=np.float32)
+        if self.context > 1:
+            signals = (signals - self._mean[None, :, None]) / self._std[None, :, None]
+            return torch.from_numpy(signals), torch.from_numpy(self.y[gidx].astype(np.int64))
+        signals = (signals - self._mean[:, None]) / self._std[:, None]
+        return torch.from_numpy(signals), torch.tensor(int(self.y[gidx]), dtype=torch.long)
+
+
+def make_lazy_dataloader(dataset, batch_size=64, shuffle=False, balanced=False, num_workers=0):
+    """Wrap a ``MemmapEpochDataset`` in a DataLoader (no full-array materialization).
+
+    balanced=True draws class-balanced mini-batches (per-epoch datasets only).
+    """
+    if balanced and dataset.context == 1:
+        labels = dataset.labels
+        counts = np.bincount(labels)
+        sample_weights = 1.0 / counts[labels]
+        sampler = WeightedRandomSampler(
+            torch.tensor(sample_weights, dtype=torch.double), len(sample_weights), replacement=True
+        )
+        return DataLoader(dataset, batch_size=batch_size, sampler=sampler, num_workers=num_workers)
+    return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, num_workers=num_workers)
 
 
 def _build_weight_tensor(class_weights, n_classes, device):

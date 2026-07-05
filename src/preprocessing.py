@@ -116,3 +116,37 @@ def apply_normalizer(x, mean, std):
     """Apply a normalizer fit on training data. Never refit on validation/test."""
     x = np.asarray(x, dtype=float)
     return (x - mean) / std
+
+
+def fit_normalizer_streaming(x, indices=None, chunk_size=4096):
+    """Per-channel mean/std from a (possibly memmapped) array without loading it whole.
+
+    Same result and output shape as `fit_normalizer` — mean/std of shape
+    (1, n_channels, 1) — but the array is read in chunks of `chunk_size` epochs
+    and only float64 per-channel accumulators are kept, so peak RAM stays around
+    one chunk instead of the whole (tens-of-GB) signal array. This is what lets
+    the DL pipeline compute training statistics on the full Sleep-EDF memmap.
+
+    Parameters
+    ----------
+    x : array or memmap of shape (n_epochs, n_channels, n_samples).
+    indices : optional integer indices selecting the TRAINING epochs; defaults to
+        all rows. Passing only the training indices keeps normalization leakage-safe.
+    chunk_size : epochs read per iteration.
+    """
+    n_channels = x.shape[1]
+    indices = np.arange(len(x)) if indices is None else np.asarray(indices)
+
+    channel_sum = np.zeros(n_channels, dtype=np.float64)
+    channel_sumsq = np.zeros(n_channels, dtype=np.float64)
+    total = 0
+    for start in range(0, len(indices), chunk_size):
+        chunk = np.asarray(x[indices[start:start + chunk_size]], dtype=np.float64)
+        channel_sum += chunk.sum(axis=(0, 2))
+        channel_sumsq += (chunk ** 2).sum(axis=(0, 2))
+        total += chunk.shape[0] * chunk.shape[2]
+
+    mean = channel_sum / total
+    std = np.sqrt(np.maximum(channel_sumsq / total - mean ** 2, 0.0))
+    std[std == 0] = 1.0
+    return mean.reshape(1, n_channels, 1), std.reshape(1, n_channels, 1)

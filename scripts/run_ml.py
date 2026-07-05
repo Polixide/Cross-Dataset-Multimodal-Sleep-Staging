@@ -22,7 +22,7 @@ from tqdm.auto import tqdm
 
 from src.data_loader import leave_one_subject_out, load_processed_dataset, subject_wise_split
 from src.evaluate import compute_metrics, probabilistic_metrics, summarize_folds
-from src.features import extract_features_dataset
+from src.features import load_or_extract_features
 from src.models_ml import build_estimator
 from src.train import calibrate_classifier, cross_validate_ml, tune_ml
 from src.utils import STAGE_NAMES, ensure_dir, get_logger, save_json, save_pickle, set_seed
@@ -31,17 +31,20 @@ logger = get_logger("run_ml")
 LABELS = list(range(len(STAGE_NAMES)))
 
 
-def get_feature_matrix(dataset, sfreq):
+def get_feature_matrix(dataset, sfreq, cache_path):
     """Return the feature matrix as a DataFrame, extracting it if data is raw epochs.
 
-    The named columns flow into the fitted estimator (``feature_names_in_``) so
-    SHAP and reporting can label features without a separate name list. A dataset
-    that is already a 2D feature matrix is wrapped with generic column names.
+    Extraction is cached to ``cache_path`` (shared with run_benchmark.py), so the
+    ~53 min feature extraction happens once and every later single-model run reads
+    it back from disk. The named columns flow into the fitted estimator
+    (``feature_names_in_``) so SHAP and reporting can label features without a
+    separate name list. A dataset that is already a 2D feature matrix is wrapped
+    with generic column names.
     """
     if dataset.x.ndim == 3:
-        logger.info("Extracting features from raw epochs (%d epochs, sfreq=%g Hz)...",
-                    len(dataset.y), sfreq)
-        return extract_features_dataset(dataset.x, sfreq)
+        logger.info("Loading/extracting features (%d epochs, sfreq=%g Hz, cache: %s)...",
+                    len(dataset.y), sfreq, cache_path)
+        return load_or_extract_features(dataset.x, sfreq, cache_path)
     x = np.asarray(dataset.x)
     return pd.DataFrame(x, columns=[f"feature_{i}" for i in range(x.shape[1])])
 
@@ -89,6 +92,9 @@ def main():
                         help="Optionally keep only the top-k features by RF importance.")
     parser.add_argument("--sfreq", type=float, default=None,
                         help="Override the sampling rate; defaults to the value stored in the .npz.")
+    parser.add_argument("--feature-cache", default=None,
+                        help="Feature cache .npy path (default: data/processed/cache/<stem>_features.npy). "
+                             "Shared with run_benchmark.py so extraction happens only once.")
     parser.add_argument("--out", default="results/tables/ml_metrics.json")
     parser.add_argument("--model-out", default="results/logs/ml_model.pkl")
     parser.add_argument("--probs-out", default="results/logs/ml_test_probs.npz")
@@ -97,7 +103,8 @@ def main():
     set_seed()
     dataset = load_processed_dataset(args.data)
     sfreq = args.sfreq or dataset.sfreq or 100.0
-    x = get_feature_matrix(dataset, sfreq)
+    cache = args.feature_cache or f"data/processed/cache/{Path(args.data).stem}_features.npy"
+    x = get_feature_matrix(dataset, sfreq, cache)
     feature_names = list(x.columns)
     y, subjects = dataset.y, dataset.subjects
     logger.info("Loaded %d epochs from %d subjects (%d features).",

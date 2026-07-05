@@ -228,3 +228,40 @@ def make_epoch_sequences(x, y, subjects, seq_len, stride=None):
             y_windows.append(y_subject[start:start + seq_len])
             window_subjects.append(subject)
     return np.array(x_windows), np.array(y_windows), np.array(window_subjects)
+
+
+def build_sequence_windows(subjects, split_idx, seq_len, stride=None):
+    """Global-index windows of consecutive epochs within each subject (temporal context).
+
+    Same windowing rule as `make_epoch_sequences` (non-overlapping by default,
+    never crossing subject boundaries, trailing remainder dropped) but it returns
+    only INDICES into the full array instead of the signals, so the epochs stay on
+    disk and can be read lazily by a memmap-backed Dataset. Because epochs of a
+    subject are stored contiguously and in time order, sliding over that subject's
+    sorted split indices reproduces the epoch ordering exactly.
+
+    Parameters
+    ----------
+    subjects : subject id per epoch for the WHOLE dataset (n_epochs,).
+    split_idx : integer indices selecting the epochs of one subject-wise split.
+    seq_len : epochs per window.
+
+    Returns
+    -------
+    (n_windows, seq_len) int array of global indices; empty if no subject in the
+    split has at least ``seq_len`` epochs.
+    """
+    if stride is None:
+        stride = seq_len
+    subjects = np.asarray(subjects)
+    split_idx = np.asarray(split_idx)
+    split_subjects = subjects[split_idx]
+
+    windows = []
+    for subject in np.unique(split_subjects):
+        subject_positions = split_idx[split_subjects == subject]  # sorted global indices
+        for start in range(0, len(subject_positions) - seq_len + 1, stride):
+            windows.append(subject_positions[start:start + seq_len])
+    if not windows:
+        return np.empty((0, seq_len), dtype=np.int64)
+    return np.asarray(windows, dtype=np.int64)

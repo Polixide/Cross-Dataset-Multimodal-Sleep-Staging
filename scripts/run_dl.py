@@ -27,15 +27,16 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import numpy as np
 import torch
 
-from src.data_loader import load_processed_dataset, make_epoch_sequences, subject_wise_split
+from src.data_loader import build_sequence_windows, load_processed_dataset, subject_wise_split
 from src.evaluate import compute_metrics, probabilistic_metrics
 from src.models_dl import build_dl_model, build_sequence_model
-from src.preprocessing import apply_normalizer, fit_normalizer
+from src.preprocessing import fit_normalizer_streaming
 from src.train import (
+    MemmapEpochDataset,
     compute_class_weights,
     evaluate_dl,
     fit_temperature,
-    make_dataloader,
+    make_lazy_dataloader,
     predict_logits_dl,
     random_search_dl,
     softmax_with_temperature,
@@ -58,12 +59,18 @@ def evaluate_missing_modality(model, test_loader):
     return results
 
 
-def split_epochs(x_norm, y, subjects, idx, context):
-    """Return the (x, y) for a split, as sequences when context > 1."""
+def build_split_dataset(x, y, subjects, split_idx, mean, std, context):
+    """Build a lazy, memmap-backed dataset for one subject-wise split.
+
+    Signals are read on the fly from the memmap and normalized per item, so the
+    full array never enters RAM. With context > 1 the item indices are sequences
+    of consecutive within-subject epochs (temporal context).
+    """
     if context > 1:
-        x_seq, y_seq, _ = make_epoch_sequences(x_norm[idx], y[idx], subjects[idx], context)
-        return x_seq, y_seq
-    return x_norm[idx], y[idx]
+        item_index = build_sequence_windows(subjects, split_idx, context)
+    else:
+        item_index = np.asarray(split_idx)
+    return MemmapEpochDataset(x, y, item_index, mean, std, context=context)
 
 
 def main():
@@ -96,21 +103,21 @@ def main():
     logger.info("Subject-wise split -> train=%d val=%d test=%d epochs (context=%d).",
                 len(train_idx), len(val_idx), len(test_idx), args.context)
 
-    # Normalize every epoch with statistics from the training subjects only.
-    mean, std = fit_normalizer(dataset.x[train_idx])
-    x_norm = apply_normalizer(dataset.x, mean, std)
+    # Per-channel statistics from the training subjects only, streamed off the
+    # memmap so the full (tens-of-GB) signal array is never materialized in RAM.
+    mean, std = fit_normalizer_streaming(dataset.x, train_idx)
 
-    x_train, y_train = split_epochs(x_norm, dataset.y, subjects, train_idx, args.context)
-    x_val, y_val = split_epochs(x_norm, dataset.y, subjects, val_idx, args.context)
-    x_test, y_test = split_epochs(x_norm, dataset.y, subjects, test_idx, args.context)
+    train_ds = build_split_dataset(dataset.x, dataset.y, subjects, train_idx, mean, std, args.context)
+    val_ds = build_split_dataset(dataset.x, dataset.y, subjects, val_idx, mean, std, args.context)
+    test_ds = build_split_dataset(dataset.x, dataset.y, subjects, test_idx, mean, std, args.context)
 
-    train_loader = make_dataloader(x_train, y_train, args.batch_size,
-                                   shuffle=True, balanced=args.balanced_batches)
-    val_loader = make_dataloader(x_val, y_val, args.batch_size)
-    test_loader = make_dataloader(x_test, y_test, args.batch_size)
+    train_loader = make_lazy_dataloader(train_ds, args.batch_size,
+                                        shuffle=True, balanced=args.balanced_batches)
+    val_loader = make_lazy_dataloader(val_ds, args.batch_size)
+    test_loader = make_lazy_dataloader(test_ds, args.batch_size)
 
     n_channels = dataset.x.shape[1]
-    class_weights = compute_class_weights(np.asarray(y_train).reshape(-1))
+    class_weights = compute_class_weights(train_ds.labels)
 
     def model_factory():
         if args.context > 1:
@@ -157,10 +164,11 @@ def main():
 
     if args.external:
         external = load_processed_dataset(args.external)
-        x_external = apply_normalizer(external.x, mean, std)
-        xe, ye = (make_epoch_sequences(x_external, external.y, external.subjects, args.context)[:2]
-                  if args.context > 1 else (x_external, external.y))
-        external_loader = make_dataloader(xe, ye, args.batch_size)
+        # Reuse the training normalizer (no refit) and read the external memmap lazily.
+        external_idx = np.arange(len(external.y))
+        external_ds = build_split_dataset(external.x, external.y, external.subjects,
+                                          external_idx, mean, std, args.context)
+        external_loader = make_lazy_dataloader(external_ds, args.batch_size)
         output["external_metrics"] = evaluate_dl(model, external_loader)
         logger.info("External macro-F1: %.3f", output["external_metrics"]["macro_f1"])
 

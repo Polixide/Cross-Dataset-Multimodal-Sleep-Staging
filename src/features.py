@@ -4,10 +4,15 @@ Organized by the domains from the master plan: time, frequency, nonlinear and
 time-frequency. `extract_features_dataset` turns a raw epoch array into the
 labelled feature DataFrame the ML models consume.
 """
+import json
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 from scipy.signal import stft, welch
 from tqdm.auto import tqdm
+
+from src.utils import ensure_dir
 
 # Standard EEG frequency bands in Hz.
 FREQ_BANDS = {
@@ -151,3 +156,28 @@ def extract_features_dataset(x, sfreq, channel_names=None, progress=True):
     if feature_names is None:  # no epochs
         return pd.DataFrame()
     return pd.DataFrame(np.asarray(rows, dtype=float), columns=feature_names)
+
+
+def load_or_extract_features(x, sfreq, cache_path, channel_names=None, progress=True):
+    """Return the feature DataFrame, caching it to disk to skip recomputation.
+
+    A benchmark sweep fits many models on the SAME features, so extracting the
+    ~96 features over hundreds of thousands of epochs once and reusing them turns
+    a multi-hour sweep into a single extraction. The cache is a plain numpy
+    ``.npy`` of the values plus a sibling ``*.columns.json`` of the column names
+    (no extra dependency vs parquet). It is reused only when its row count matches
+    the number of epochs, so a regenerated dataset transparently recomputes.
+    """
+    cache_path = Path(cache_path)
+    cols_path = cache_path.with_suffix(".columns.json")
+    if cache_path.exists() and cols_path.exists():
+        values = np.load(cache_path)
+        if values.shape[0] == len(x):
+            columns = json.loads(cols_path.read_text(encoding="utf-8"))
+            return pd.DataFrame(values, columns=columns)
+
+    features = extract_features_dataset(x, sfreq, channel_names, progress)
+    ensure_dir(cache_path.parent)
+    np.save(cache_path, features.to_numpy())
+    cols_path.write_text(json.dumps(list(features.columns)), encoding="utf-8")
+    return features
