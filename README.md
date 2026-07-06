@@ -50,6 +50,9 @@ tests/        tests for the leakage-sensitive logic
 Core logic is split into `src/common/`, `src/ml/`, and `src/dl/`; runnable CLIs
 mirror that separation under `scripts/`.
 
+La descrizione metodologica completa della parte ML è disponibile in
+[`ML_WORKFLOW_CHECK.md`](ML_WORKFLOW_CHECK.md).
+
 ## Getting started
 
 ```bash

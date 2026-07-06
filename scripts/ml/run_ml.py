@@ -154,8 +154,9 @@ def main():
     parser.add_argument(
         "--calibration",
         default="sigmoid",
-        choices=["sigmoid", "isotonic"],
+        choices=["none", "sigmoid", "isotonic"],
         help=("Probability calibration fitted on validation subjects. "
+              "Use 'none' to keep the estimator's native probabilities. "
               "Sigmoid is the safer default; isotonic is more flexible but can alter "
               "minority-class decisions aggressively."),
     )
@@ -281,14 +282,22 @@ def main():
     test_metrics_raw = compute_metrics(y[test_idx], y_pred_raw, labels=LABELS)
     prob_metrics_raw = probabilistic_metrics(y[test_idx], prob_raw)
 
-    # Fit calibration on validation subjects only, then evaluate once on test.
-    calibrated = calibrate_classifier(
-        final_model, x[val_idx], y[val_idx], method=args.calibration
-    )
-    y_pred_cal = calibrated.predict(x[test_idx])
-    prob_cal = calibrated.predict_proba(x[test_idx])
-    test_metrics_cal = compute_metrics(y[test_idx], y_pred_cal, labels=LABELS)
-    prob_metrics_cal = probabilistic_metrics(y[test_idx], prob_cal)
+    # Optionally fit calibration on validation subjects, then evaluate on test.
+    if args.calibration == "none":
+        fitted_output_model = final_model
+        y_pred_cal = y_pred_raw
+        prob_cal = prob_raw
+        test_metrics_cal = test_metrics_raw
+        prob_metrics_cal = prob_metrics_raw
+        logger.info("Calibration disabled; retaining native model probabilities.")
+    else:
+        fitted_output_model = calibrate_classifier(
+            final_model, x[val_idx], y[val_idx], method=args.calibration
+        )
+        y_pred_cal = fitted_output_model.predict(x[test_idx])
+        prob_cal = fitted_output_model.predict_proba(x[test_idx])
+        test_metrics_cal = compute_metrics(y[test_idx], y_pred_cal, labels=LABELS)
+        prob_metrics_cal = probabilistic_metrics(y[test_idx], prob_cal)
 
     logger.info(
         "Test macro-F1 raw %.3f -> calibrated %.3f | ECE raw %.3f -> calibrated %.3f",
@@ -296,7 +305,7 @@ def main():
         prob_metrics_raw["ece"], prob_metrics_cal["ece"],
     )
 
-    save_pickle(calibrated, args.model_out)
+    save_pickle(fitted_output_model, args.model_out)
     ensure_dir(Path(args.probs_out).parent)
     np.savez_compressed(
         args.probs_out,

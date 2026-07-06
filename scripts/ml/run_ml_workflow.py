@@ -45,9 +45,11 @@ def model_paths(model, suffix=""):
 
 def train_model(model, balance, data, folds, suffix=""):
     paths = model_paths(model, suffix)
+    calibration = "none" if model == "logreg" else "sigmoid"
     run_command(
         "scripts/ml/run_ml.py", "--data", data, "--model", model,
         "--balance", balance, "--folds", folds, "--tune",
+        "--calibration", calibration,
         "--json-out", paths["metrics"],
         "--model-out", paths["model"],
         "--probs-out", paths["probs"],
