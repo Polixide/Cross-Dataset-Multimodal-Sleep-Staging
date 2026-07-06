@@ -13,6 +13,9 @@ imbalanced-learn
 # Deep learning baselines
 torch
 
+# Bayesian hyperparameter optimization for the DL models
+optuna
+
 # Explainability
 shap
 

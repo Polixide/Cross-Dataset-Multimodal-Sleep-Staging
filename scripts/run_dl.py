@@ -9,12 +9,17 @@ hierarchical sequence model (SequenceSleepStager): sequences of N consecutive
 epochs are built within each subject and a Transformer attends across them,
 predicting one label per epoch (temporal context).
 
-Optionally: random-search tuning, modality ablations, missing-modality
-robustness, external validation, class-balanced mini-batches.
+Optionally: Bayesian (Optuna) or random hyperparameter search, modality ablations,
+missing-modality robustness, external validation, class-balanced mini-batches.
+
+Runs on GPU automatically when one is available (--device auto); on Colab add
+--num-workers 2 so the memmap reads keep the GPU fed.
 
 Examples:
     python scripts/run_dl.py --data data/processed/sleep_edf.npz --model transformer
     python scripts/run_dl.py --data data/processed/sleep_edf.npz --model cnn --context 15
+    python scripts/run_dl.py --data data/processed/sleep_edf.npz --model transformer \
+        --context 11 --tune --search-method bayes --num-workers 2
     python scripts/run_dl.py --data data/processed/sleep_edf.npz --model transformer \
         --context 11 --external data/processed/hmc.npz
 """
@@ -33,6 +38,7 @@ from src.models_dl import build_dl_model, build_sequence_model
 from src.preprocessing import fit_normalizer_streaming
 from src.train import (
     MemmapEpochDataset,
+    bayesian_search_dl,
     compute_class_weights,
     evaluate_dl,
     fit_temperature,
@@ -48,13 +54,13 @@ logger = get_logger("run_dl")
 LABELS = list(range(len(STAGE_NAMES)))
 
 
-def evaluate_missing_modality(model, test_loader):
+def evaluate_missing_modality(model, test_loader, device="cpu"):
     """Evaluate the trained transformer with each modality dropped in turn."""
     baseline = model.active_modalities
     results = {}
     for dropped in model.modality_names:
         model.active_modalities = [name for name in model.modality_names if name != dropped]
-        results[f"drop_{dropped}"] = evaluate_dl(model, test_loader)["macro_f1"]
+        results[f"drop_{dropped}"] = evaluate_dl(model, test_loader, device)["macro_f1"]
     model.active_modalities = baseline
     return results
 
@@ -82,9 +88,23 @@ def main():
     parser.add_argument("--modalities", nargs="+", default=["eeg", "eog", "emg"],
                         choices=["eeg", "eog", "emg"], help="Active modalities (transformer only).")
     parser.add_argument("--epochs", type=int, default=20)
+    parser.add_argument("--patience", type=int, default=None,
+                        help="Early-stopping patience: stop after this many epochs with no "
+                             "val macro-F1 improvement. Omit to train all --epochs.")
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--loss", default="weighted_ce", choices=["weighted_ce", "focal"])
-    parser.add_argument("--tune", action="store_true", help="Random-search learning rate and loss.")
+    parser.add_argument("--tune", action="store_true",
+                        help="Tune training hyperparameters (see --search-method).")
+    parser.add_argument("--search-method", default="bayes", choices=["bayes", "random"],
+                        help="Hyperparameter search when --tune is set: 'bayes' (Optuna TPE, "
+                             "the master-plan strategy) or 'random'.")
+    parser.add_argument("--n-trials", type=int, default=15,
+                        help="Number of search trials when --tune is set.")
+    parser.add_argument("--device", default="auto", choices=["auto", "cuda", "cpu"],
+                        help="Compute device. 'auto' uses CUDA when available (e.g. Colab GPU).")
+    parser.add_argument("--num-workers", type=int, default=0,
+                        help="DataLoader worker processes. Use >0 on Colab/Linux to keep the GPU "
+                             "fed; keep 0 on Windows.")
     parser.add_argument("--balanced-batches", action="store_true",
                         help="Draw class-balanced mini-batches (per-epoch only).")
     parser.add_argument("--external", help="Optional processed .npz for external validation.")
@@ -96,6 +116,19 @@ def main():
 
     set_seed()
     torch.manual_seed(RANDOM_SEED)
+
+    if args.device == "auto":
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+    else:
+        device = args.device
+    if device == "cuda":
+        torch.cuda.manual_seed_all(RANDOM_SEED)
+        logger.info("Using GPU: %s", torch.cuda.get_device_name(0))
+    else:
+        if args.device == "cuda":
+            logger.warning("CUDA requested but not available; falling back to CPU.")
+        logger.info("Using CPU.")
+    pin_memory = device == "cuda"
 
     dataset = load_processed_dataset(args.data)
     subjects = dataset.subjects
@@ -111,10 +144,13 @@ def main():
     val_ds = build_split_dataset(dataset.x, dataset.y, subjects, val_idx, mean, std, args.context)
     test_ds = build_split_dataset(dataset.x, dataset.y, subjects, test_idx, mean, std, args.context)
 
-    train_loader = make_lazy_dataloader(train_ds, args.batch_size,
-                                        shuffle=True, balanced=args.balanced_batches)
-    val_loader = make_lazy_dataloader(val_ds, args.batch_size)
-    test_loader = make_lazy_dataloader(test_ds, args.batch_size)
+    train_loader = make_lazy_dataloader(train_ds, args.batch_size, shuffle=True,
+                                        balanced=args.balanced_batches,
+                                        num_workers=args.num_workers, pin_memory=pin_memory)
+    val_loader = make_lazy_dataloader(val_ds, args.batch_size,
+                                      num_workers=args.num_workers, pin_memory=pin_memory)
+    test_loader = make_lazy_dataloader(test_ds, args.batch_size,
+                                       num_workers=args.num_workers, pin_memory=pin_memory)
 
     n_channels = dataset.x.shape[1]
     class_weights = compute_class_weights(train_ds.labels)
@@ -125,22 +161,26 @@ def main():
                                         active_modalities=args.modalities, max_len=max(args.context, 8))
         return build_dl_model(args.model, n_channels, len(STAGE_NAMES), active_modalities=args.modalities)
 
-    output = {"model": args.model, "context": args.context, "modalities": args.modalities, "loss": args.loss}
+    output = {"model": args.model, "context": args.context, "modalities": args.modalities,
+              "loss": args.loss, "device": device}
     if args.tune:
-        best, trials = random_search_dl(model_factory, train_loader, val_loader,
-                                        epochs=args.epochs, class_weights=class_weights)
+        search = bayesian_search_dl if args.search_method == "bayes" else random_search_dl
+        best, trials = search(model_factory, train_loader, val_loader, n_trials=args.n_trials,
+                              epochs=args.epochs, class_weights=class_weights,
+                              patience=args.patience, device=device)
         model = best["model"]
-        output["tuning"] = {"best": {k: best[k] for k in ("lr", "use_focal", "val_macro_f1")}, "trials": trials}
-        logger.info("Best DL hyperparameters: lr=%s focal=%s (val macro-F1 %.3f)",
-                    best["lr"], best["use_focal"], best["val_macro_f1"])
+        best_summary = {k: best[k] for k in best if k != "model"}
+        output["tuning"] = {"method": args.search_method, "best": best_summary, "trials": trials}
+        logger.info("Best DL hyperparameters (%s search): %s", args.search_method, best_summary)
     else:
         model, history = train_dl(model_factory(), train_loader, val_loader, epochs=args.epochs,
-                                  class_weights=class_weights, use_focal=(args.loss == "focal"))
+                                  class_weights=class_weights, use_focal=(args.loss == "focal"),
+                                  patience=args.patience, device=device)
         output["history"] = history
 
     # Temperature scaling on validation, then evaluate on the held-out test.
-    y_val_true, val_logits = predict_logits_dl(model, val_loader)
-    y_test_true, test_logits = predict_logits_dl(model, test_loader)
+    y_val_true, val_logits = predict_logits_dl(model, val_loader, device)
+    y_test_true, test_logits = predict_logits_dl(model, test_loader, device)
     temperature = fit_temperature(val_logits, y_val_true)
     prob_raw = softmax_with_temperature(test_logits, 1.0)
     prob_cal = softmax_with_temperature(test_logits, temperature)
@@ -159,7 +199,7 @@ def main():
     })
 
     if args.missing_modality_test and args.model == "transformer" and args.context == 1:
-        output["missing_modality_macro_f1"] = evaluate_missing_modality(model, test_loader)
+        output["missing_modality_macro_f1"] = evaluate_missing_modality(model, test_loader, device)
         logger.info("Missing-modality macro-F1: %s", output["missing_modality_macro_f1"])
 
     if args.external:
@@ -168,8 +208,9 @@ def main():
         external_idx = np.arange(len(external.y))
         external_ds = build_split_dataset(external.x, external.y, external.subjects,
                                           external_idx, mean, std, args.context)
-        external_loader = make_lazy_dataloader(external_ds, args.batch_size)
-        output["external_metrics"] = evaluate_dl(model, external_loader)
+        external_loader = make_lazy_dataloader(external_ds, args.batch_size,
+                                               num_workers=args.num_workers, pin_memory=pin_memory)
+        output["external_metrics"] = evaluate_dl(model, external_loader, device)
         logger.info("External macro-F1: %.3f", output["external_metrics"]["macro_f1"])
 
     ensure_dir(Path(args.probs_out).parent)

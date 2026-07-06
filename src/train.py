@@ -8,6 +8,8 @@
 Random search is used for the DL model instead of Bayesian optimization to avoid
 an extra dependency; it can be swapped for optuna without changing the callers.
 """
+import warnings
+
 import numpy as np
 import torch
 from scipy.optimize import minimize_scalar
@@ -166,10 +168,17 @@ class MemmapEpochDataset(Dataset):
         return torch.from_numpy(signals), torch.tensor(int(self.y[gidx]), dtype=torch.long)
 
 
-def make_lazy_dataloader(dataset, batch_size=64, shuffle=False, balanced=False, num_workers=0):
+def make_lazy_dataloader(dataset, batch_size=64, shuffle=False, balanced=False,
+                         num_workers=0, pin_memory=False):
     """Wrap a ``MemmapEpochDataset`` in a DataLoader (no full-array materialization).
 
     balanced=True draws class-balanced mini-batches (per-epoch datasets only).
+
+    On a GPU run set ``num_workers>0`` so several worker processes read the memmap
+    in parallel and keep the GPU fed (each ``__getitem__`` is a disk read), and
+    ``pin_memory=True`` so host->device copies are faster. On Windows keep
+    ``num_workers=0`` (process spawning is fragile there); on Colab/Linux a couple
+    of workers is a clear win.
     """
     if balanced and dataset.context == 1:
         labels = dataset.labels
@@ -178,8 +187,10 @@ def make_lazy_dataloader(dataset, batch_size=64, shuffle=False, balanced=False, 
         sampler = WeightedRandomSampler(
             torch.tensor(sample_weights, dtype=torch.double), len(sample_weights), replacement=True
         )
-        return DataLoader(dataset, batch_size=batch_size, sampler=sampler, num_workers=num_workers)
-    return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, num_workers=num_workers)
+        return DataLoader(dataset, batch_size=batch_size, sampler=sampler,
+                          num_workers=num_workers, pin_memory=pin_memory)
+    return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle,
+                      num_workers=num_workers, pin_memory=pin_memory)
 
 
 def _build_weight_tensor(class_weights, n_classes, device):
@@ -218,8 +229,21 @@ def predict_logits_dl(model, loader, device="cpu"):
 
 
 def train_dl(model, train_loader, val_loader, epochs=20, lr=1e-3,
-             class_weights=None, use_focal=False, device="cpu"):
+             class_weights=None, use_focal=False, device="cpu", patience=None,
+             weight_decay=0.0, focal_gamma=2.0):
     """Train a deep model and keep the weights with the best validation macro-F1.
+
+    Model selection is on validation macro-F1, so the returned model is the best
+    epoch's, never the last. With ``patience`` set, training also stops early once
+    validation macro-F1 has not improved for ``patience`` consecutive epochs (the
+    best weights are still restored), which avoids wasting epochs after the
+    validation curve has plateaued — worth it here because each epoch is a full
+    pass over the memmapped dataset. ``patience=None`` disables early stopping and
+    runs all ``epochs``.
+
+    ``device`` selects CPU vs GPU ("cuda"); pass "cuda" on a GPU box (e.g. Colab)
+    for the big speed-up. ``weight_decay`` (Adam L2) and ``focal_gamma`` are the
+    training hyperparameters the search routines tune.
 
     Returns (model, history); history has per-epoch train loss and val macro-F1.
     """
@@ -228,19 +252,22 @@ def train_dl(model, train_loader, val_loader, epochs=20, lr=1e-3,
     if class_weights is not None:
         weight_tensor = _build_weight_tensor(class_weights, model.n_classes, device)
 
-    criterion = FocalLoss(weight=weight_tensor) if use_focal else torch.nn.CrossEntropyLoss(weight=weight_tensor)
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    criterion = (FocalLoss(gamma=focal_gamma, weight=weight_tensor)
+                 if use_focal else torch.nn.CrossEntropyLoss(weight=weight_tensor))
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
 
     history = []
     best_macro_f1 = -1.0
     best_state = None
+    epochs_without_improvement = 0
     epoch_bar = tqdm(range(epochs), desc="Training", unit="epoch")
     for epoch in epoch_bar:
         model.train()
         epoch_loss = 0.0
         batch_bar = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{epochs}", unit="batch", leave=False)
         for x_batch, y_batch in batch_bar:
-            x_batch, y_batch = x_batch.to(device), y_batch.to(device)
+            x_batch = x_batch.to(device, non_blocking=True)
+            y_batch = y_batch.to(device, non_blocking=True)
             optimizer.zero_grad()
             logits = model(x_batch)
             # reshape unifies per-epoch (batch, C) and sequence (batch, seq_len, C) outputs.
@@ -256,11 +283,20 @@ def train_dl(model, train_loader, val_loader, epochs=20, lr=1e-3,
             "train_loss": epoch_loss / len(train_loader),
             "val_macro_f1": val_metrics["macro_f1"],
         })
-        epoch_bar.set_postfix(train_loss=f"{epoch_loss / len(train_loader):.3f}",
-                              val_f1=f"{val_metrics['macro_f1']:.3f}")
         if val_metrics["macro_f1"] > best_macro_f1:
             best_macro_f1 = val_metrics["macro_f1"]
             best_state = {name: tensor.cpu().clone() for name, tensor in model.state_dict().items()}
+            epochs_without_improvement = 0
+        else:
+            epochs_without_improvement += 1
+        epoch_bar.set_postfix(train_loss=f"{epoch_loss / len(train_loader):.3f}",
+                              val_f1=f"{val_metrics['macro_f1']:.3f}",
+                              best_f1=f"{best_macro_f1:.3f}",
+                              stale=epochs_without_improvement)
+        if patience is not None and epochs_without_improvement >= patience:
+            epoch_bar.write(f"Early stopping at epoch {epoch + 1}/{epochs}: val macro-F1 did not "
+                            f"improve for {patience} epoch(s) (best {best_macro_f1:.3f}).")
+            break
 
     if best_state is not None:
         model.load_state_dict(best_state)
@@ -268,10 +304,12 @@ def train_dl(model, train_loader, val_loader, epochs=20, lr=1e-3,
 
 
 def random_search_dl(model_factory, train_loader, val_loader, n_trials=6, epochs=10,
-                     class_weights=None, seed=42):
+                     class_weights=None, seed=42, patience=None, device="cpu"):
     """Random search over learning rate and loss type (validation macro-F1).
 
-    model_factory is a zero-argument callable returning a fresh model.
+    model_factory is a zero-argument callable returning a fresh model. ``patience``
+    is forwarded to ``train_dl`` so each trial can stop early once its validation
+    macro-F1 plateaus. Kept as a dependency-free fallback for ``bayesian_search_dl``.
     Returns (best, trials): best has the trained model plus its hyperparameters.
     """
     rng = np.random.default_rng(seed)
@@ -280,12 +318,72 @@ def random_search_dl(model_factory, train_loader, val_loader, n_trials=6, epochs
     for _ in tqdm(range(n_trials), desc="Random search", unit="trial"):
         lr = float(rng.choice(learning_rates))
         use_focal = bool(rng.integers(0, 2))
-        model, history = train_dl(model_factory(), train_loader, val_loader,
-                                  epochs=epochs, lr=lr, class_weights=class_weights, use_focal=use_focal)
+        model, history = train_dl(model_factory(), train_loader, val_loader, epochs=epochs, lr=lr,
+                                  class_weights=class_weights, use_focal=use_focal,
+                                  patience=patience, device=device)
         score = max(step["val_macro_f1"] for step in history)
         trials.append({"lr": lr, "use_focal": use_focal, "val_macro_f1": score})
         if best is None or score > best["val_macro_f1"]:
             best = {"model": model, "lr": lr, "use_focal": use_focal, "val_macro_f1": score}
+    return best, trials
+
+
+def bayesian_search_dl(model_factory, train_loader, val_loader, n_trials=15, epochs=10,
+                       class_weights=None, seed=42, patience=None, device="cpu"):
+    """Bayesian optimization (Optuna TPE) over DL training hyperparameters.
+
+    The master plan asks for Bayesian optimization rather than grid/random search
+    for the deep models: the search space is larger and mixes continuous, categorical
+    and conditional dimensions, where a Tree-structured Parzen Estimator is more
+    sample-efficient than blind sampling. Each trial trains a fresh model from
+    ``model_factory`` (a zero-argument callable, so the architecture is fixed) and
+    varies only the training hyperparameters:
+
+    - ``lr``            : learning rate, log-uniform in [1e-4, 1e-2]
+    - ``weight_decay``  : Adam L2 penalty, log-uniform in [1e-6, 1e-3]
+    - ``use_focal``     : weighted cross-entropy vs focal loss (categorical)
+    - ``focal_gamma``   : focal focusing parameter in [1.0, 3.0], only when focal
+                          (a conditional dimension — a natural fit for TPE)
+
+    Selection is on validation macro-F1, mirroring ``train_dl``. If Optuna is not
+    installed it falls back to ``random_search_dl`` (with a warning), so the
+    pipeline still runs. Returns (best, trials) with the same shape as
+    ``random_search_dl`` so callers are unchanged.
+    """
+    try:
+        import optuna
+    except ImportError:
+        warnings.warn("Optuna not installed; falling back to random search. "
+                      "Install it with `pip install optuna` for Bayesian optimization.",
+                      RuntimeWarning)
+        return random_search_dl(model_factory, train_loader, val_loader, n_trials=n_trials,
+                                epochs=epochs, class_weights=class_weights, seed=seed,
+                                patience=patience, device=device)
+
+    optuna.logging.set_verbosity(optuna.logging.WARNING)
+    best = {"val_macro_f1": -1.0}
+    trials = []
+
+    def objective(trial):
+        nonlocal best
+        lr = trial.suggest_float("lr", 1e-4, 1e-2, log=True)
+        weight_decay = trial.suggest_float("weight_decay", 1e-6, 1e-3, log=True)
+        use_focal = trial.suggest_categorical("use_focal", [False, True])
+        focal_gamma = trial.suggest_float("focal_gamma", 1.0, 3.0) if use_focal else 2.0
+        model, history = train_dl(model_factory(), train_loader, val_loader, epochs=epochs, lr=lr,
+                                  weight_decay=weight_decay, class_weights=class_weights,
+                                  use_focal=use_focal, focal_gamma=focal_gamma,
+                                  patience=patience, device=device)
+        score = max(step["val_macro_f1"] for step in history)
+        record = {"lr": lr, "weight_decay": weight_decay, "use_focal": use_focal,
+                  "focal_gamma": focal_gamma, "val_macro_f1": score}
+        trials.append(record)
+        if score > best["val_macro_f1"]:
+            best = {"model": model, **record}
+        return score
+
+    study = optuna.create_study(direction="maximize", sampler=optuna.samplers.TPESampler(seed=seed))
+    study.optimize(objective, n_trials=n_trials, show_progress_bar=True)
     return best, trials
 
 
