@@ -211,3 +211,26 @@ def build_sequence_model(name, n_channels, n_classes=5, active_modalities=None, 
     """Wrap a per-epoch encoder in a SequenceSleepStager for temporal context."""
     epoch_encoder = build_dl_model(name, n_channels, n_classes, active_modalities=active_modalities)
     return SequenceSleepStager(epoch_encoder, n_classes=n_classes, max_len=max_len)
+
+
+def load_dl_checkpoint(path, device="cpu"):
+    """Rebuild a trained DL model from a checkpoint saved by ``run_dl.py``.
+
+    The checkpoint carries the architecture config (model name, context, channels,
+    modalities) plus the training normalizer and temperature, so the exact model can
+    be reconstructed for evaluation or explainability (e.g. Grad-CAM). Returns
+    (model, checkpoint_dict); the model is on ``device`` in eval mode.
+
+    ``weights_only=False`` because the checkpoint also stores the numpy normalizer.
+    """
+    checkpoint = torch.load(path, map_location=device, weights_only=False)
+    if checkpoint["context"] > 1:
+        model = build_sequence_model(checkpoint["model"], checkpoint["n_channels"],
+                                     checkpoint["n_classes"], active_modalities=checkpoint["modalities"],
+                                     max_len=checkpoint["max_len"])
+    else:
+        model = build_dl_model(checkpoint["model"], checkpoint["n_channels"],
+                               checkpoint["n_classes"], active_modalities=checkpoint["modalities"])
+    model.load_state_dict(checkpoint["state_dict"])
+    model.to(device).eval()
+    return model, checkpoint

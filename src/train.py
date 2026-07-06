@@ -324,7 +324,8 @@ def random_search_dl(model_factory, train_loader, val_loader, n_trials=6, epochs
         score = max(step["val_macro_f1"] for step in history)
         trials.append({"lr": lr, "use_focal": use_focal, "val_macro_f1": score})
         if best is None or score > best["val_macro_f1"]:
-            best = {"model": model, "lr": lr, "use_focal": use_focal, "val_macro_f1": score}
+            best = {"model": model, "history": history, "lr": lr,
+                    "use_focal": use_focal, "val_macro_f1": score}
     return best, trials
 
 
@@ -379,7 +380,7 @@ def bayesian_search_dl(model_factory, train_loader, val_loader, n_trials=15, epo
                   "focal_gamma": focal_gamma, "val_macro_f1": score}
         trials.append(record)
         if score > best["val_macro_f1"]:
-            best = {"model": model, **record}
+            best = {"model": model, "history": history, **record}
         return score
 
     study = optuna.create_study(direction="maximize", sampler=optuna.samplers.TPESampler(seed=seed))

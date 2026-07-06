@@ -77,7 +77,11 @@ python scripts/analyze_features.py --data data/processed/sleep_edf.npz
 python scripts/run_ml.py --data data/processed/sleep_edf.npz --model rf --feature-selection
 
 # 4. Deep learning — Cross-Modal Transformer with temporal context
+#    (auto-uses a GPU when present; add --tune for Bayesian hyperparameter search)
 python scripts/run_dl.py --data data/processed/sleep_edf.npz --model transformer --context 11
+python scripts/run_dl.py --data data/processed/sleep_edf.npz --model transformer --context 15 \
+    --tune --search-method bayes --num-workers 2
+# On Colab GPU: run notebooks/05_colab_dl_benchmark.ipynb (Sleep-EDF benchmark sweep)
 
 # 5. External validation on a second dataset (frozen model)
 python scripts/run_external.py --model-path results/logs/ml_model.pkl --external data/processed/hmc.npz
@@ -117,7 +121,12 @@ The full pipeline is implemented and tested:
   signals) without loading it into RAM.
 - **Imbalance:** class weights, SMOTE / random oversampling (ML), focal loss and
   balanced mini-batches (DL).
-- **Tuning:** grid search (ML) and random search (DL), both subject-wise.
+- **Tuning:** grid search (ML) and, for DL, Bayesian optimization (Optuna TPE over
+  learning rate / weight decay / loss / focal gamma, `--tune --search-method bayes`)
+  with random search kept as a fallback, all subject-wise.
+- **Compute:** DL runs on GPU automatically (`--device auto`); `--num-workers`
+  parallelizes the memmap reads. A ready-to-run Colab notebook for the Sleep-EDF
+  DL benchmark sweep is in `notebooks/05_colab_dl_benchmark.ipynb`.
 - **Evaluation:** macro-F1, weighted-F1, balanced accuracy, kappa, per-class
   scores, confusion matrices, one-vs-rest AUPRC / ROC-AUC.
 - **Calibration:** raw-vs-calibrated ECE / Brier — isotonic/Platt (ML) and
@@ -129,6 +138,6 @@ The full pipeline is implemented and tested:
 The data-preparation scripts (`prepare_sleep_edf.py`, `prepare_hmc.py`) follow
 the standard dataset formats and need the actual datasets in `data/raw/` to run.
 Everything else is verified on synthetic data and
-by the test suite (`pytest`, 33 tests). One documented design choice: DL
-hyperparameter search uses random search rather than Bayesian optimization, to
-avoid an extra dependency.
+by the test suite (`pytest`, 33 tests). DL hyperparameter search uses Bayesian
+optimization (Optuna), as recommended in the project plan, and falls back to
+random search when Optuna is not installed.

@@ -112,6 +112,9 @@ def main():
                         help="Evaluate the transformer with each modality dropped (context=1).")
     parser.add_argument("--out", default="results/tables/dl_metrics.json")
     parser.add_argument("--probs-out", default="results/logs/dl_test_probs.npz")
+    parser.add_argument("--model-out", default="results/logs/dl_model.pt",
+                        help="Checkpoint path: trained weights + config + normalizer + temperature, "
+                             "so the model can be reloaded for evaluation or Grad-CAM.")
     args = parser.parse_args()
 
     set_seed()
@@ -169,8 +172,12 @@ def main():
                               epochs=args.epochs, class_weights=class_weights,
                               patience=args.patience, device=device)
         model = best["model"]
-        best_summary = {k: best[k] for k in best if k != "model"}
+        best_summary = {k: best[k] for k in best if k not in ("model", "history")}
         output["tuning"] = {"method": args.search_method, "best": best_summary, "trials": trials}
+        # Keep the winning trial's training history so learning curves are still
+        # available after a tuned run (make_figures.py reads output["history"]).
+        if "history" in best:
+            output["history"] = best["history"]
         logger.info("Best DL hyperparameters (%s search): %s", args.search_method, best_summary)
     else:
         model, history = train_dl(model_factory(), train_loader, val_loader, epochs=args.epochs,
@@ -215,6 +222,26 @@ def main():
 
     ensure_dir(Path(args.probs_out).parent)
     np.savez_compressed(args.probs_out, y_true=y_test_true, y_prob=prob_cal, y_prob_raw=prob_raw)
+
+    # Persist the trained model so it can be reloaded for evaluation or Grad-CAM
+    # without retraining. Includes the config to rebuild the architecture, the
+    # training normalizer (so inputs are normalized identically) and the fitted
+    # temperature.
+    ensure_dir(Path(args.model_out).parent)
+    torch.save({
+        "state_dict": model.state_dict(),
+        "model": args.model,
+        "context": args.context,
+        "modalities": args.modalities,
+        "n_channels": n_channels,
+        "n_classes": len(STAGE_NAMES),
+        "max_len": max(args.context, 8),
+        "mean": mean,
+        "std": std,
+        "temperature": temperature,
+    }, args.model_out)
+    logger.info("Saved DL model checkpoint to %s", args.model_out)
+
     save_json(output, args.out)
     logger.info("Saved DL metrics to %s", args.out)
 
