@@ -42,12 +42,13 @@ for how to obtain and place them.
 ```
 data/         raw / processed / splits   (contents git-ignored)
 src/          reusable pipeline logic (data, preprocessing, models, eval, XAI)
-scripts/      thin runnable entry points (prepare data, run models, figures)
+scripts/      runnable entry points split into data/, ml/, dl/, shared/
 results/      generated tables, figures and logs (contents git-ignored)
 tests/        tests for the leakage-sensitive logic
 ```
 
-Core logic lives in `src/`; `scripts/` are thin, runnable CLIs.
+Core logic is split into `src/common/`, `src/ml/`, and `src/dl/`; runnable CLIs
+mirror that separation under `scripts/`.
 
 ## Getting started
 
@@ -60,16 +61,26 @@ Prepare data, then run a baseline:
 
 ```bash
 # 1. Build model-ready epochs (see scripts for arguments)
-python scripts/prepare_sleep_edf.py --raw-dir data/raw/sleep_edf --out data/processed/sleep_edf.npz
+python scripts/data/prepare_sleep_edf.py --raw-dir data/raw/sleep_edf --out data/processed/sleep_edf.npz
 
 # 2. Feature-based ML with subject-wise cross-validation
-python scripts/run_ml.py --data data/processed/sleep_edf.npz --model rf
+python scripts/ml/run_ml.py --data data/processed/sleep_edf.npz --model rf
 
 # 3. Deep learning — Cross-Modal Transformer with temporal context
-python scripts/run_dl.py --data data/processed/sleep_edf.npz --model transformer --context 11
+python scripts/dl/run_dl.py --data data/processed/sleep_edf.npz --model transformer --context 11
 
 # 4. External validation on a second dataset (frozen model)
-python scripts/run_external.py --model-path results/logs/ml_model.pkl --external data/processed/hmc.npz
+python scripts/ml/run_external.py --model-path results/logs/ml_model.pkl --external data/processed/hmc.npz
+```
+
+Run the complete ML workflow from an already processed HMC dataset (HMC feature
+extraction, train-only GroupKFold
+tuning with sample weights, automatic best-model SMOTE ablation, HMC external
+validation, figures, SHAP, final best-variant LOSO, and a pandas summary with
+overfitting flags):
+
+```bash
+python scripts/ml/run_ml_workflow.py
 ```
 
 ## Tests
@@ -89,13 +100,14 @@ The full pipeline is implemented and tested:
 - **Data:** subject-wise splitting with a leakage guard, label harmonization,
   training-only normalization, and feature extraction (time / frequency /
   nonlinear / time-frequency) for the ML pipeline.
-- **Models:** feature-based ML (SVM, RF, gradient boosting, logistic — scaled
+- **Models:** feature-based ML (multinomial logistic regression, RF, XGBoost — scaled
   where needed) and deep learning (1D-CNN, CNN-LSTM, and the Cross-Modal
   Transformer with modality masking for ablations and missing-modality tests).
 - **Temporal context:** `--context N` turns any DL model into a hierarchical
   sequence model over N neighboring epochs (one label per epoch), with the
   single-epoch models kept as the with/without-context baseline.
-- **Imbalance:** class weights, SMOTE / random oversampling (ML), focal loss and
+- **Imbalance:** fold-local balanced sample weights, SMOTE / random oversampling
+  ablations (ML), focal loss and
   balanced mini-batches (DL).
 - **Tuning:** grid search (ML) and random search (DL), both subject-wise.
 - **Evaluation:** macro-F1, weighted-F1, balanced accuracy, kappa, per-class
@@ -106,8 +118,8 @@ The full pipeline is implemented and tested:
 - **Validation:** internal held-out test, external cross-dataset validation, and
   LOSO robustness; figures via `make_figures.py`.
 
-The data-preparation scripts (`prepare_sleep_edf.py`, `prepare_hmc.py`,
-`prepare_shhs.py`) follow the standard dataset formats and need the actual
+The data-preparation scripts under `scripts/data/` follow the standard dataset
+formats and need the actual
 datasets in `data/raw/` to run. Everything else is verified on synthetic data and
 by the test suite (`pytest`, 27 tests). One documented design choice: DL
 hyperparameter search uses random search rather than Bayesian optimization, to

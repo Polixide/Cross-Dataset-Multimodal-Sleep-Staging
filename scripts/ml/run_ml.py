@@ -1,0 +1,306 @@
+"""Train and evaluate the feature-based ML pipeline.
+
+Extracts features from raw epochs, runs subject-wise cross-validation, fits the
+final model on the training subjects, calibrates on the validation subjects, and
+evaluates on the held-out internal test subjects. The fitted (calibrated) model
+is saved for external validation, together with the test-set probabilities.
+
+Headline scalar metrics are appended to a shared CSV comparison table
+(results/tables/ml_metrics.csv), one row per model run, so several models can be
+compared side by side. The detailed nested metrics (confusion matrix, per-class
+arrays) needed by make_figures are saved per model under results/logs/.
+
+Examples:
+    python scripts/ml/run_ml.py --data data/processed/sleep_edf.npz --model rf
+    python scripts/ml/run_ml.py --data data/processed/sleep_edf.npz --model logreg --balance smote --tune
+    python scripts/ml/run_ml.py --data data/processed/sleep_edf.npz --model rf --loso
+"""
+import argparse
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+import numpy as np
+from scipy.special import softmax
+
+from src.common.data import leave_one_subject_out, load_processed_dataset, subject_wise_split
+from src.common.evaluation import compute_metrics, probabilistic_metrics, summarize_folds
+from src.ml.features import extract_features_dataset
+from src.ml.models import build_estimator
+from src.ml.train import calibrate_classifier, cross_validate_ml, tune_ml
+from src.common.utils import (
+    STAGE_NAMES,
+    append_metrics_row,
+    ensure_dir,
+    get_logger,
+    load_json,
+    save_json,
+    save_pickle,
+    set_seed,
+)
+
+logger = get_logger("run_ml")
+LABELS = list(range(len(STAGE_NAMES)))
+
+# Columns that identify a run in the comparison table. Re-running the same
+# configuration replaces its row; different configs accumulate as new rows.
+KEY_COLS = ["model", "balance", "calibration", "tuned", "loso"]
+
+
+def metrics_row(model, balance, calibration, tuned, loso, test_metrics,
+                cv_summary=None, prob_metrics=None, best_params=None,
+                overfitting=None):
+    """Flatten the headline scalar metrics into one row for the CSV table."""
+    row = {
+        "model": model,
+        "balance": balance,
+        "calibration": calibration,
+        "tuned": tuned,
+        "loso": loso,
+        "best_params": "" if best_params is None else str(best_params),
+        "accuracy": test_metrics["accuracy"],
+        "balanced_accuracy": test_metrics["balanced_accuracy"],
+        "macro_f1": test_metrics["macro_f1"],
+        "weighted_f1": test_metrics["weighted_f1"],
+        "cohen_kappa": test_metrics["cohen_kappa"],
+    }
+    for name, f1 in zip(STAGE_NAMES, test_metrics["per_class_f1"]):
+        row[f"f1_{name}"] = f1
+    if cv_summary is not None:
+        row["cv_macro_f1_mean"] = cv_summary["macro_f1"]["mean"]
+        row["cv_macro_f1_std"] = cv_summary["macro_f1"]["std"]
+        row["cv_cohen_kappa_mean"] = cv_summary["cohen_kappa"]["mean"]
+    if prob_metrics is not None:
+        row["macro_auprc"] = prob_metrics["macro_auprc"]
+        row["macro_roc_auc"] = prob_metrics["macro_roc_auc"]
+        row["ece"] = prob_metrics["ece"]
+        row["brier"] = prob_metrics["brier"]
+    if overfitting is not None:
+        row.update(overfitting)
+    return row
+
+
+def get_feature_matrix(dataset, sfreq):
+    """Return a 2D feature matrix, extracting features if the data is raw epochs."""
+    if dataset.x.ndim == 3:
+        logger.info("Extracting features from raw epochs (%d epochs)...", len(dataset.y))
+        features, _ = extract_features_dataset(dataset.x, sfreq)
+        return features
+    return dataset.x
+
+
+def uncalibrated_probabilities(estimator, x):
+    """Return native probabilities or a softmax decision-score proxy.
+
+    Estimators without native probabilities use a softmax decision-score proxy
+    only for the diagnostic raw-vs-calibrated comparison. Downstream use should
+    prefer the calibrated probabilities.
+    """
+    if hasattr(estimator, "predict_proba"):
+        return estimator.predict_proba(x)
+    scores = estimator.decision_function(x)
+    if scores.ndim == 1:
+        scores = np.column_stack([-scores, scores])
+    return softmax(scores, axis=1)
+
+
+def run_loso(x, y, subjects, model, balance, out_path, json_path, best_params=None):
+    """Leave-one-subject-out robustness analysis (secondary)."""
+    y_true, y_pred = [], []
+    for train_idx, test_idx in leave_one_subject_out(subjects):
+        estimator = build_estimator(model, balance)
+        if best_params:
+            estimator.set_params(**best_params)
+        estimator.fit(x[train_idx], y[train_idx])
+        y_pred.append(estimator.predict(x[test_idx]))
+        y_true.append(y[test_idx])
+    metrics = compute_metrics(np.concatenate(y_true), np.concatenate(y_pred), labels=LABELS)
+    save_json({
+        "model": model,
+        "balance": balance,
+        "tuned": bool(best_params),
+        "best_params": best_params,
+        "loso_metrics": metrics,
+    }, json_path)
+    row = metrics_row(model, balance, calibration="", tuned=bool(best_params), loso=True,
+                      test_metrics=metrics, best_params=best_params)
+    append_metrics_row(row, out_path, KEY_COLS)
+    logger.info("LOSO macro-F1: %.3f | kappa: %.3f", metrics["macro_f1"], metrics["cohen_kappa"])
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Run the feature-based ML benchmark.")
+    parser.add_argument("--data", required=True, help="Processed .npz with (x, y, subjects).")
+    parser.add_argument("--model", default="rf", choices=["logreg", "rf", "xgb"])
+    parser.add_argument("--balance", default="sample_weight",
+                        choices=["sample_weight", "class_weight", "none", "smote", "oversample"])
+    parser.add_argument("--folds", type=int, default=5)
+    parser.add_argument("--tune", action="store_true", help="Grid-search hyperparameters.")
+    parser.add_argument("--loso", action="store_true", help="Run leave-one-subject-out instead.")
+    parser.add_argument("--params-from", default=None,
+                        help="Metrics JSON whose best_params are reused for LOSO.")
+    parser.add_argument(
+        "--calibration",
+        default="sigmoid",
+        choices=["sigmoid", "isotonic"],
+        help=("Probability calibration fitted on validation subjects. "
+              "Sigmoid is the safer default; isotonic is more flexible but can alter "
+              "minority-class decisions aggressively."),
+    )
+    parser.add_argument("--sfreq", type=float, default=100.0)
+    parser.add_argument("--out", default="results/tables/ml_metrics.csv",
+                        help="Comparison table (CSV). Accumulates one row per "
+                             "model run instead of overwriting.")
+    parser.add_argument("--json-out", default=None,
+                        help="Detailed metrics JSON (used by make_figures). "
+                             "Defaults to results/logs/ml_metrics_<model>.json.")
+    parser.add_argument("--model-out", default=None,
+                        help="Fitted model path. Defaults to "
+                             "results/logs/ml_model_<model>.pkl.")
+    parser.add_argument("--probs-out", default=None,
+                        help="Test-set probabilities path. Defaults to "
+                             "results/logs/ml_test_probs_<model>.npz.")
+    args = parser.parse_args()
+
+    # Per-model detailed artifacts so different models don't overwrite each
+    # other; the CSV comparison table (--out) accumulates a row per model.
+    if args.json_out is None:
+        args.json_out = f"results/logs/ml_metrics_{args.model}.json"
+    if args.model_out is None:
+        args.model_out = f"results/logs/ml_model_{args.model}.pkl"
+    if args.probs_out is None:
+        args.probs_out = f"results/logs/ml_test_probs_{args.model}.npz"
+
+    set_seed()
+    dataset = load_processed_dataset(args.data)
+    x = get_feature_matrix(dataset, args.sfreq)
+    y, subjects = dataset.y, dataset.subjects
+    logger.info("Loaded %d epochs from %d subjects (%d features).",
+                len(y), dataset.n_subjects, x.shape[1])
+
+    if args.loso:
+        loso_params = None
+        if args.params_from:
+            loso_params = load_json(args.params_from).get("best_params")
+            if not loso_params:
+                parser.error(f"No best_params found in {args.params_from}")
+        run_loso(
+            x, y, subjects, args.model, args.balance, args.out, args.json_out,
+            best_params=loso_params,
+        )
+        return
+
+    train_idx, val_idx, test_idx = subject_wise_split(subjects)
+    logger.info(
+        "Subject-wise split: train=%d, validation=%d, test=%d subjects.",
+        len(np.unique(subjects[train_idx])),
+        len(np.unique(subjects[val_idx])),
+        len(np.unique(subjects[test_idx])),
+    )
+
+    # Cross-validation is restricted to training subjects. Validation subjects
+    # remain untouched until probability calibration, and test subjects remain
+    # untouched until the final evaluation.
+    n_splits = min(args.folds, len(np.unique(subjects[train_idx])))
+    cv_metrics = cross_validate_ml(
+        lambda: build_estimator(args.model, args.balance),
+        x[train_idx], y[train_idx], subjects[train_idx],
+        n_splits=n_splits, labels=LABELS,
+    )
+    cv_summary = summarize_folds(cv_metrics)
+    cv_train_macro_f1 = float(np.mean([fold["train_macro_f1"] for fold in cv_metrics]))
+    overfitting_gap = cv_train_macro_f1 - cv_summary["macro_f1"]["mean"]
+    overfitting = {
+        "cv_train_macro_f1_mean": cv_train_macro_f1,
+        "overfitting_gap": overfitting_gap,
+        "overfitted": bool(overfitting_gap > 0.10),
+        "overfitting_status": "overfitted" if overfitting_gap > 0.10 else "not_overfitted",
+    }
+    logger.info("CV macro-F1: %.3f +/- %.3f",
+                cv_summary["macro_f1"]["mean"], cv_summary["macro_f1"]["std"])
+    logger.info(
+        "CV train macro-F1: %.3f | gap: %.3f | %s",
+        cv_train_macro_f1, overfitting_gap, overfitting["overfitting_status"],
+    )
+
+    # Fit the final model on the training subjects (optionally tuned).
+    best_params = None
+    if args.tune:
+        tune_splits = min(args.folds, len(np.unique(subjects[train_idx])))
+        final_model, best_params, best_score = tune_ml(
+            build_estimator(args.model, args.balance), args.model,
+            x[train_idx], y[train_idx], subjects[train_idx], n_splits=tune_splits,
+        )
+        logger.info("Best params: %s (CV macro-F1 %.3f)", best_params, best_score)
+    else:
+        final_model = build_estimator(args.model, args.balance)
+        final_model.fit(x[train_idx], y[train_idx])
+
+    # Evaluate the uncalibrated classifier and its probabilities separately.
+    # Calibration is intended to improve probability quality (ECE/Brier), and is
+    # not guaranteed to improve the argmax decision or macro-F1.
+    y_pred_raw = final_model.predict(x[test_idx])
+    prob_raw = uncalibrated_probabilities(final_model, x[test_idx])
+    test_metrics_raw = compute_metrics(y[test_idx], y_pred_raw, labels=LABELS)
+    prob_metrics_raw = probabilistic_metrics(y[test_idx], prob_raw)
+
+    # Fit calibration on validation subjects only, then evaluate once on test.
+    calibrated = calibrate_classifier(
+        final_model, x[val_idx], y[val_idx], method=args.calibration
+    )
+    y_pred_cal = calibrated.predict(x[test_idx])
+    prob_cal = calibrated.predict_proba(x[test_idx])
+    test_metrics_cal = compute_metrics(y[test_idx], y_pred_cal, labels=LABELS)
+    prob_metrics_cal = probabilistic_metrics(y[test_idx], prob_cal)
+
+    logger.info(
+        "Test macro-F1 raw %.3f -> calibrated %.3f | ECE raw %.3f -> calibrated %.3f",
+        test_metrics_raw["macro_f1"], test_metrics_cal["macro_f1"],
+        prob_metrics_raw["ece"], prob_metrics_cal["ece"],
+    )
+
+    save_pickle(calibrated, args.model_out)
+    ensure_dir(Path(args.probs_out).parent)
+    np.savez_compressed(
+        args.probs_out,
+        y_true=y[test_idx],
+        y_pred_raw=y_pred_raw,
+        y_pred_calibrated=y_pred_cal,
+        y_prob_raw=prob_raw,
+        y_prob=prob_cal,  # Backward-compatible name for calibrated probabilities.
+        y_prob_calibrated=prob_cal,
+    )
+    # Detailed nested metrics (confusion matrix, per-class arrays) for figures.
+    save_json({
+        "model": args.model, "balance": args.balance, "tuned": args.tune, "best_params": best_params,
+        "calibration": args.calibration,
+        "protocol": {
+            "cross_validation": "training_subjects_only",
+            "validation_role": "probability_calibration_only",
+            "test_role": "final_evaluation_only",
+        },
+        "cv_summary": cv_summary,
+        "overfitting": overfitting,
+        # Keep test_metrics as the calibrated result for compatibility with
+        # existing consumers, while exposing both variants explicitly.
+        "test_metrics": test_metrics_cal,
+        "test_metrics_raw": test_metrics_raw,
+        "test_metrics_calibrated": test_metrics_cal,
+        "test_prob_metrics_raw": prob_metrics_raw,
+        "test_prob_metrics_calibrated": prob_metrics_cal,
+    }, args.json_out)
+
+    # Append the headline scalars to the shared CSV comparison table.
+    row = metrics_row(
+        args.model, args.balance, args.calibration, args.tune, loso=False,
+        test_metrics=test_metrics_cal, cv_summary=cv_summary,
+        prob_metrics=prob_metrics_cal, best_params=best_params,
+        overfitting=overfitting,
+    )
+    append_metrics_row(row, args.out, KEY_COLS)
+    logger.info("Appended metrics to %s and saved model to %s", args.out, args.model_out)
+
+
+if __name__ == "__main__":
+    main()

@@ -7,6 +7,7 @@ env/
 .pytest_cache
 .ipynb_checkpoints/
 .pytest_cache/
+.pytest-tmp*/
 *.egg-info/
 
 # Data — large and/or access-restricted; keep the folder structure only
@@ -24,6 +25,19 @@ results/logs/*
 !results/tables/.gitkeep
 !results/figures/.gitkeep
 !results/logs/.gitkeep
+
+# Publish lightweight reports, figures and current ML prediction vectors.
+!results/tables/*.csv
+!results/tables/*.json
+!results/figures/**/
+!results/figures/**/*.png
+!results/figures/*.png
+!results/logs/ml_metrics_rf.json
+!results/logs/ml_metrics_xgb.json
+!results/logs/ml_metrics_logreg.json
+!results/logs/ml_test_probs_rf.npz
+!results/logs/ml_test_probs_xgb.npz
+!results/logs/ml_test_probs_logreg.npz
 
 # Trained models / large binaries
 *.pt

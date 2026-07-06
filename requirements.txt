@@ -3,6 +3,7 @@ numpy
 scipy
 pandas
 scikit-learn
+xgboost
 
 # EDF / PSG signal handling
 mne
