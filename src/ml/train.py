@@ -1,5 +1,6 @@
 """Training, subject-wise tuning and post-hoc calibration for classical ML."""
 import numpy as np
+from sklearn.base import clone
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.frozen import FrozenEstimator
 from sklearn.model_selection import GridSearchCV, GroupKFold
@@ -54,8 +55,15 @@ def cross_validate_ml(model_builder, x, y, subjects, n_splits=5, labels=None):
     return fold_metrics
 
 
-def tune_ml(estimator, name, x, y, subjects, n_splits=5, scoring="f1_macro"):
-    """Grid-search model hyperparameters with subject-wise GroupKFold."""
+def tune_ml(estimator, name, x, y, subjects, n_splits=5, scoring="f1_macro",
+            max_overfitting_gap=0.10):
+    """Tune with GroupKFold, rejecting configurations that overfit.
+
+    Among configurations whose mean train-minus-validation score is at most
+    ``max_overfitting_gap``, select the one with the highest validation score.
+    If none satisfies the constraint, select the smallest-gap configuration and
+    report that the constraint was not satisfied.
+    """
     grid = ML_PARAM_GRIDS[name.lower()]
     prefix = ""
     base_estimator = estimator
@@ -70,9 +78,34 @@ def tune_ml(estimator, name, x, y, subjects, n_splits=5, scoring="f1_macro"):
     search = GridSearchCV(
         estimator, grid, scoring=scoring,
         cv=GroupKFold(n_splits=n_splits), n_jobs=-1,
+        return_train_score=True, refit=False,
     )
     search.fit(x, y, groups=subjects)
-    return search.best_estimator_, search.best_params_, float(search.best_score_)
+    results = search.cv_results_
+    val_scores = np.asarray(results["mean_test_score"], dtype=float)
+    train_scores = np.asarray(results["mean_train_score"], dtype=float)
+    gaps = train_scores - val_scores
+    eligible = np.flatnonzero(gaps <= max_overfitting_gap)
+    constraint_satisfied = bool(len(eligible))
+    if constraint_satisfied:
+        selected = int(eligible[np.argmax(val_scores[eligible])])
+    else:
+        # Deterministic fallback: smallest gap, then highest validation score.
+        min_gap = np.nanmin(gaps)
+        candidates = np.flatnonzero(np.isclose(gaps, min_gap))
+        selected = int(candidates[np.argmax(val_scores[candidates])])
+
+    best_params = results["params"][selected]
+    best_estimator = clone(estimator).set_params(**best_params)
+    best_estimator.fit(x, y)
+    selection = {
+        "cv_macro_f1": float(val_scores[selected]),
+        "cv_train_macro_f1": float(train_scores[selected]),
+        "overfitting_gap": float(gaps[selected]),
+        "max_overfitting_gap": float(max_overfitting_gap),
+        "constraint_satisfied": constraint_satisfied,
+    }
+    return best_estimator, best_params, selection
 
 
 def calibrate_classifier(fitted_estimator, x_val, y_val, method="isotonic"):

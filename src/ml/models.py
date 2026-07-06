@@ -6,6 +6,7 @@ oversampling — resampling is applied inside training folds only, never on
 validation/test.
 
 """
+import numpy as np
 from imblearn.over_sampling import RandomOverSampler, SMOTE
 from imblearn.pipeline import Pipeline as ImbPipeline
 from sklearn.base import BaseEstimator, ClassifierMixin
@@ -14,9 +15,37 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 from sklearn.utils.class_weight import compute_sample_weight
+from tqdm import tqdm
 
 # Models that need standardized features; tree models are scale-invariant.
 SCALE_SENSITIVE = {"logreg"}
+
+
+class TqdmSMOTE(SMOTE):
+    """SMOTE variant that makes the otherwise silent resampling stage visible."""
+
+    def __init__(self, *, sampling_strategy="auto", random_state=None, k_neighbors=5):
+        super().__init__(
+            sampling_strategy=sampling_strategy,
+            random_state=random_state,
+            k_neighbors=k_neighbors,
+        )
+
+    def fit_resample(self, x, y, **params):
+        with tqdm(total=1, desc="SMOTE resampling", unit="stage") as progress:
+            result = super().fit_resample(x, y, **params)
+            progress.update(1)
+        return result
+
+
+def half_majority_strategy(y):
+    """Oversample minority classes only up to 50% of the majority count."""
+    classes, counts = np.unique(y, return_counts=True)
+    target = int(counts.max() * 0.5)
+    return {
+        int(cls): target for cls, count in zip(classes, counts)
+        if count < target
+    }
 
 
 class AutoSampleWeightClassifier(ClassifierMixin, BaseEstimator):
@@ -104,10 +133,17 @@ def build_ml_model(name, class_weight="balanced", seed=42):
 def build_balanced_pipeline(name, method="smote", seed=42):
     """Return a pipeline that oversamples the training fold before fitting.
 
-    method : 'smote' or 'oversample' (random oversampling). Uses an imblearn
-    pipeline so resampling never touches validation/test data.
+    method : 'smote', 'smote_half', or 'oversample'. ``smote_half`` caps each
+    minority at 50% of the majority. Resampling never touches validation/test.
     """
-    sampler = SMOTE(random_state=seed) if method == "smote" else RandomOverSampler(random_state=seed)
+    if method == "smote":
+        sampler = TqdmSMOTE(random_state=seed)
+    elif method == "smote_half":
+        sampler = TqdmSMOTE(
+            sampling_strategy=half_majority_strategy, random_state=seed
+        )
+    else:
+        sampler = RandomOverSampler(random_state=seed)
     steps = []
     if name.lower() in SCALE_SENSITIVE:
         steps.append(("scaler", StandardScaler()))
@@ -119,7 +155,8 @@ def build_balanced_pipeline(name, method="smote", seed=42):
 def build_estimator(name, balance="sample_weight", seed=42):
     """Single entry point selecting the imbalance strategy.
 
-    balance : 'sample_weight' | 'class_weight' | 'none' | 'smote' | 'oversample'.
+    balance : 'sample_weight' | 'class_weight' | 'none' | 'smote' |
+              'smote_half' | 'oversample'.
     """
     if balance == "sample_weight":
         return AutoSampleWeightClassifier(
@@ -135,6 +172,29 @@ def build_estimator(name, balance="sample_weight", seed=42):
         return build_ml_model(name, class_weight="balanced", seed=seed)
     if balance == "none":
         return build_ml_model(name, class_weight=None, seed=seed)
-    if balance in ("smote", "oversample"):
+    if balance in ("smote", "smote_half", "oversample"):
         return build_balanced_pipeline(name, method=balance, seed=seed)
     raise ValueError(f"Unknown balance strategy: {balance}")
+
+
+def adapt_params_to_estimator(estimator, params):
+    """Map saved hyperparameters onto a differently wrapped estimator.
+
+    For example, XGBoost parameters saved as ``estimator__max_depth`` by the
+    class-weight wrapper become ``clf__max_depth`` in the SMOTE pipeline.
+    """
+    available = estimator.get_params(deep=True)
+    adapted = {}
+    for key, value in params.items():
+        if key in available:
+            adapted[key] = value
+            continue
+        leaf = key.rsplit("__", 1)[-1]
+        matches = [candidate for candidate in available
+                   if candidate.rsplit("__", 1)[-1] == leaf]
+        if len(matches) != 1:
+            raise ValueError(
+                f"Cannot map saved parameter {key!r} to {type(estimator).__name__}."
+            )
+        adapted[matches[0]] = value
+    return adapted

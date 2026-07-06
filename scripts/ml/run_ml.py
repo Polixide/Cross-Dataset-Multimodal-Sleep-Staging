@@ -23,11 +23,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 import numpy as np
 from scipy.special import softmax
+from sklearn.base import clone
+from tqdm import tqdm
 
 from src.common.data import leave_one_subject_out, load_processed_dataset, subject_wise_split
 from src.common.evaluation import compute_metrics, probabilistic_metrics, summarize_folds
 from src.ml.features import extract_features_dataset
-from src.ml.models import build_estimator
+from src.ml.models import adapt_params_to_estimator, build_estimator
 from src.ml.train import calibrate_classifier, cross_validate_ml, tune_ml
 from src.common.utils import (
     STAGE_NAMES,
@@ -108,10 +110,16 @@ def uncalibrated_probabilities(estimator, x):
 def run_loso(x, y, subjects, model, balance, out_path, json_path, best_params=None):
     """Leave-one-subject-out robustness analysis (secondary)."""
     y_true, y_pred = [], []
-    for train_idx, test_idx in leave_one_subject_out(subjects):
+    folds = leave_one_subject_out(subjects)
+    for train_idx, test_idx in tqdm(
+        folds,
+        total=len(np.unique(subjects)),
+        desc="LOSO subjects",
+        unit="subject",
+    ):
         estimator = build_estimator(model, balance)
         if best_params:
-            estimator.set_params(**best_params)
+            estimator.set_params(**adapt_params_to_estimator(estimator, best_params))
         estimator.fit(x[train_idx], y[train_idx])
         y_pred.append(estimator.predict(x[test_idx]))
         y_true.append(y[test_idx])
@@ -134,12 +142,15 @@ def main():
     parser.add_argument("--data", required=True, help="Processed .npz with (x, y, subjects).")
     parser.add_argument("--model", default="rf", choices=["logreg", "rf", "xgb"])
     parser.add_argument("--balance", default="sample_weight",
-                        choices=["sample_weight", "class_weight", "none", "smote", "oversample"])
+                        choices=["sample_weight", "class_weight", "none", "smote",
+                                 "smote_half", "oversample"])
     parser.add_argument("--folds", type=int, default=5)
     parser.add_argument("--tune", action="store_true", help="Grid-search hyperparameters.")
+    parser.add_argument("--skip-cv", action="store_true",
+                        help="Skip GroupKFold evaluation and fit one final model.")
     parser.add_argument("--loso", action="store_true", help="Run leave-one-subject-out instead.")
     parser.add_argument("--params-from", default=None,
-                        help="Metrics JSON whose best_params are reused for LOSO.")
+                        help="Metrics JSON whose best_params are reused without tuning.")
     parser.add_argument(
         "--calibration",
         default="sigmoid",
@@ -162,6 +173,8 @@ def main():
                         help="Test-set probabilities path. Defaults to "
                              "results/logs/ml_test_probs_<model>.npz.")
     args = parser.parse_args()
+    if args.tune and args.params_from:
+        parser.error("Use either --tune or --params-from, not both.")
 
     # Per-model detailed artifacts so different models don't overwrite each
     # other; the CSV comparison table (--out) accumulates a row per model.
@@ -199,42 +212,65 @@ def main():
         len(np.unique(subjects[test_idx])),
     )
 
-    # Cross-validation is restricted to training subjects. Validation subjects
-    # remain untouched until probability calibration, and test subjects remain
-    # untouched until the final evaluation.
+    # Tune only on training subjects. Configurations with a train-validation
+    # Macro-F1 gap above 0.10 are rejected by the selector.
     n_splits = min(args.folds, len(np.unique(subjects[train_idx])))
-    cv_metrics = cross_validate_ml(
-        lambda: build_estimator(args.model, args.balance),
-        x[train_idx], y[train_idx], subjects[train_idx],
-        n_splits=n_splits, labels=LABELS,
-    )
-    cv_summary = summarize_folds(cv_metrics)
-    cv_train_macro_f1 = float(np.mean([fold["train_macro_f1"] for fold in cv_metrics]))
-    overfitting_gap = cv_train_macro_f1 - cv_summary["macro_f1"]["mean"]
-    overfitting = {
-        "cv_train_macro_f1_mean": cv_train_macro_f1,
-        "overfitting_gap": overfitting_gap,
-        "overfitted": bool(overfitting_gap > 0.10),
-        "overfitting_status": "overfitted" if overfitting_gap > 0.10 else "not_overfitted",
-    }
-    logger.info("CV macro-F1: %.3f +/- %.3f",
-                cv_summary["macro_f1"]["mean"], cv_summary["macro_f1"]["std"])
-    logger.info(
-        "CV train macro-F1: %.3f | gap: %.3f | %s",
-        cv_train_macro_f1, overfitting_gap, overfitting["overfitting_status"],
-    )
-
-    # Fit the final model on the training subjects (optionally tuned).
     best_params = None
+    tuning_selection = None
     if args.tune:
-        tune_splits = min(args.folds, len(np.unique(subjects[train_idx])))
-        final_model, best_params, best_score = tune_ml(
+        final_model, best_params, tuning_selection = tune_ml(
             build_estimator(args.model, args.balance), args.model,
-            x[train_idx], y[train_idx], subjects[train_idx], n_splits=tune_splits,
+            x[train_idx], y[train_idx], subjects[train_idx], n_splits=n_splits,
         )
-        logger.info("Best params: %s (CV macro-F1 %.3f)", best_params, best_score)
+        logger.info(
+            "Best constrained params: %s (CV macro-F1 %.3f | gap %.3f | constraint=%s)",
+            best_params, tuning_selection["cv_macro_f1"],
+            tuning_selection["overfitting_gap"],
+            tuning_selection["constraint_satisfied"],
+        )
+        model_builder = lambda: clone(final_model)
     else:
         final_model = build_estimator(args.model, args.balance)
+        if args.params_from:
+            source = load_json(args.params_from)
+            best_params = source.get("best_params")
+            if not best_params:
+                parser.error(f"No best_params found in {args.params_from}")
+            adapted = adapt_params_to_estimator(final_model, best_params)
+            final_model.set_params(**adapted)
+            logger.info("Reusing parameters from %s: %s", args.params_from, adapted)
+        model_builder = lambda: clone(final_model)
+
+    # Measure the selected model with subject-wise folds. Validation subjects
+    # remain untouched until calibration and test subjects until final scoring.
+    cv_summary = None
+    overfitting = None
+    if not args.skip_cv:
+        cv_metrics = cross_validate_ml(
+            model_builder,
+            x[train_idx], y[train_idx], subjects[train_idx],
+            n_splits=n_splits, labels=LABELS,
+        )
+        cv_summary = summarize_folds(cv_metrics)
+        cv_train_macro_f1 = float(np.mean([fold["train_macro_f1"] for fold in cv_metrics]))
+        overfitting_gap = cv_train_macro_f1 - cv_summary["macro_f1"]["mean"]
+        overfitting = {
+            "cv_train_macro_f1_mean": cv_train_macro_f1,
+            "overfitting_gap": overfitting_gap,
+            "overfitted": bool(overfitting_gap > 0.10),
+            "overfitting_status": "overfitted" if overfitting_gap > 0.10 else "not_overfitted",
+        }
+        logger.info("CV macro-F1: %.3f +/- %.3f",
+                    cv_summary["macro_f1"]["mean"], cv_summary["macro_f1"]["std"])
+        logger.info(
+            "CV train macro-F1: %.3f | gap: %.3f | %s",
+            cv_train_macro_f1, overfitting_gap, overfitting["overfitting_status"],
+        )
+    else:
+        logger.info("Skipping GroupKFold; fitting the final model once.")
+
+    # The tuned estimator is already refit on all training subjects.
+    if not args.tune:
         final_model.fit(x[train_idx], y[train_idx])
 
     # Evaluate the uncalibrated classifier and its probabilities separately.
@@ -273,7 +309,8 @@ def main():
     )
     # Detailed nested metrics (confusion matrix, per-class arrays) for figures.
     save_json({
-        "model": args.model, "balance": args.balance, "tuned": args.tune, "best_params": best_params,
+        "model": args.model, "balance": args.balance,
+        "tuned": bool(args.tune or args.params_from), "best_params": best_params,
         "calibration": args.calibration,
         "protocol": {
             "cross_validation": "training_subjects_only",
@@ -282,6 +319,7 @@ def main():
         },
         "cv_summary": cv_summary,
         "overfitting": overfitting,
+        "tuning_selection": tuning_selection,
         # Keep test_metrics as the calibrated result for compatibility with
         # existing consumers, while exposing both variants explicitly.
         "test_metrics": test_metrics_cal,
@@ -293,7 +331,8 @@ def main():
 
     # Append the headline scalars to the shared CSV comparison table.
     row = metrics_row(
-        args.model, args.balance, args.calibration, args.tune, loso=False,
+        args.model, args.balance, args.calibration,
+        bool(args.tune or args.params_from), loso=False,
         test_metrics=test_metrics_cal, cv_summary=cv_summary,
         prob_metrics=prob_metrics_cal, best_params=best_params,
         overfitting=overfitting,

@@ -98,6 +98,27 @@ def summary_row(model, balance, paths):
     }
 
 
+def select_best_non_overfitted(candidates):
+    """Select highest train-CV Macro-F1 subject to the overfitting constraint."""
+    scored = []
+    for name, paths in candidates.items():
+        metrics = load_json(paths["metrics"])
+        scored.append({
+            "name": name,
+            "cv": metrics["cv_summary"]["macro_f1"]["mean"],
+            "gap": metrics["overfitting"]["overfitting_gap"],
+            "eligible": not metrics["overfitting"]["overfitted"],
+        })
+    eligible = [item for item in scored if item["eligible"]]
+    if eligible:
+        return max(eligible, key=lambda item: item["cv"])["name"]
+    logger.warning(
+        "No candidate satisfies the overfitting constraint; using the "
+        "smallest-gap candidate as a documented fallback."
+    )
+    return min(scored, key=lambda item: (item["gap"], -item["cv"]))["name"]
+
+
 def main():
     parser = argparse.ArgumentParser(description="Run the complete ML workflow.")
     parser.add_argument("--sleep-features", default="data/processed/sleep_edf_features.npz")
@@ -126,28 +147,31 @@ def main():
             model, "class_weight", args.sleep_features, args.folds
         )
 
-    # Select without touching the held-out test: training-subject CV is the selector.
-    best_model = max(
-        args.models,
-        key=lambda name: load_json(primary[name]["metrics"])["cv_summary"]["macro_f1"]["mean"],
-    )
-    logger.info("Best train-CV model: %s. Running its SMOTE ablation.", best_model)
+    # Select without touching the held-out test: require gap <= 0.10, then
+    # maximize training-subject GroupKFold Macro-F1.
+    best_model = select_best_non_overfitted(primary)
+    logger.info("Best train-CV model: %s. Running its half-SMOTE ablation.", best_model)
     smote_paths = train_model(
-        best_model, "smote", args.sleep_features, args.folds, suffix="_smote"
+        best_model, "smote_half", args.sleep_features, args.folds,
+        suffix="_smote_half"
     )
 
+    balance_candidates = {
+        "class_weight": primary[best_model],
+        "smote_half": smote_paths,
+    }
+    best_balance = select_best_non_overfitted(balance_candidates)
     class_weight_cv = load_json(primary[best_model]["metrics"])["cv_summary"]["macro_f1"]["mean"]
     smote_cv = load_json(smote_paths["metrics"])["cv_summary"]["macro_f1"]["mean"]
-    best_balance = "smote" if smote_cv > class_weight_cv else "class_weight"
     logger.info(
         "Best %s imbalance strategy by train CV: %s "
-        "(class_weight=%.3f, SMOTE=%.3f).",
+        "(class_weight=%.3f, half-SMOTE=%.3f).",
         best_model, best_balance, class_weight_cv, smote_cv,
     )
 
     configurations = [
         (model, "class_weight", primary[model]) for model in args.models
-    ] + [(best_model, "smote", smote_paths)]
+    ] + [(best_model, "smote_half", smote_paths)]
 
     for model, _, paths in configurations:
         external_and_reports(
@@ -157,7 +181,7 @@ def main():
     loso_metrics = None
     if not args.skip_loso:
         loso_path = ROOT / f"results/logs/loso_metrics_{best_model}_{best_balance}.json"
-        selected_paths = smote_paths if best_balance == "smote" else primary[best_model]
+        selected_paths = smote_paths if best_balance == "smote_half" else primary[best_model]
         run_command(
             "scripts/ml/run_ml.py",
             "--data", args.sleep_features,
