@@ -115,6 +115,13 @@ def main():
     parser.add_argument("--model-out", default="results/logs/dl_model.pt",
                         help="Checkpoint path: trained weights + config + normalizer + temperature, "
                              "so the model can be reloaded for evaluation or Grad-CAM.")
+    parser.add_argument("--checkpoint-dir", default="results/checkpoints",
+                        help="Folder for periodic training checkpoints. Per-trial subfolders are "
+                             "created when tuning; the final calibrated model is also saved here as "
+                             "final.pt.")
+    parser.add_argument("--checkpoint-every", type=int, default=3,
+                        help="Save a checkpoint every N epochs (0 disables periodic saves; last.pt "
+                             "and best.pt are still kept up to date each epoch).")
     args = parser.parse_args()
 
     set_seed()
@@ -164,13 +171,25 @@ def main():
                                         active_modalities=args.modalities, max_len=max(args.context, 8))
         return build_dl_model(args.model, n_channels, len(STAGE_NAMES), active_modalities=args.modalities)
 
+    # Embedded in every periodic checkpoint so load_dl_checkpoint can rebuild the
+    # exact architecture and normalize inputs identically (temperature is added by
+    # the final calibrated save below).
+    checkpoint_root = Path(args.checkpoint_dir)
+    checkpoint_meta = {
+        "model": args.model, "context": args.context, "modalities": args.modalities,
+        "n_channels": n_channels, "n_classes": len(STAGE_NAMES),
+        "max_len": max(args.context, 8), "mean": mean, "std": std,
+    }
+
     output = {"model": args.model, "context": args.context, "modalities": args.modalities,
               "loss": args.loss, "device": device}
     if args.tune:
         search = bayesian_search_dl if args.search_method == "bayes" else random_search_dl
         best, trials = search(model_factory, train_loader, val_loader, n_trials=args.n_trials,
                               epochs=args.epochs, class_weights=class_weights,
-                              patience=args.patience, device=device)
+                              patience=args.patience, device=device,
+                              checkpoint_dir=checkpoint_root, checkpoint_every=args.checkpoint_every,
+                              checkpoint_meta=checkpoint_meta)
         model = best["model"]
         best_summary = {k: best[k] for k in best if k not in ("model", "history")}
         output["tuning"] = {"method": args.search_method, "best": best_summary, "trials": trials}
@@ -182,7 +201,9 @@ def main():
     else:
         model, history = train_dl(model_factory(), train_loader, val_loader, epochs=args.epochs,
                                   class_weights=class_weights, use_focal=(args.loss == "focal"),
-                                  patience=args.patience, device=device)
+                                  patience=args.patience, device=device,
+                                  checkpoint_dir=checkpoint_root / "train",
+                                  checkpoint_every=args.checkpoint_every, checkpoint_meta=checkpoint_meta)
         output["history"] = history
 
     # Temperature scaling on validation, then evaluate on the held-out test.
@@ -226,9 +247,9 @@ def main():
     # Persist the trained model so it can be reloaded for evaluation or Grad-CAM
     # without retraining. Includes the config to rebuild the architecture, the
     # training normalizer (so inputs are normalized identically) and the fitted
-    # temperature.
-    ensure_dir(Path(args.model_out).parent)
-    torch.save({
+    # temperature. Saved both at --model-out (referenced by the notebook / Grad-CAM
+    # cell) and as final.pt inside the ordered checkpoint folder.
+    final_checkpoint = {
         "state_dict": model.state_dict(),
         "model": args.model,
         "context": args.context,
@@ -239,8 +260,12 @@ def main():
         "mean": mean,
         "std": std,
         "temperature": temperature,
-    }, args.model_out)
-    logger.info("Saved DL model checkpoint to %s", args.model_out)
+    }
+    ensure_dir(Path(args.model_out).parent)
+    torch.save(final_checkpoint, args.model_out)
+    ensure_dir(checkpoint_root)
+    torch.save(final_checkpoint, checkpoint_root / "final.pt")
+    logger.info("Saved DL model checkpoint to %s (and %s)", args.model_out, checkpoint_root / "final.pt")
 
     save_json(output, args.out)
     logger.info("Saved DL metrics to %s", args.out)

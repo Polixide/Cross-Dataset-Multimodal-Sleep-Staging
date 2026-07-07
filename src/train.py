@@ -9,6 +9,7 @@ Random search is used for the DL model instead of Bayesian optimization to avoid
 an extra dependency; it can be swapped for optuna without changing the callers.
 """
 import warnings
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -22,6 +23,7 @@ from torch.utils.data import DataLoader, Dataset, TensorDataset, WeightedRandomS
 from src.data_loader import subject_wise_folds
 from src.evaluate import compute_metrics
 from src.models_dl import FocalLoss
+from src.utils import ensure_dir
 
 # Small, defensible search grids per model (subject-wise CV).
 ML_PARAM_GRIDS = {
@@ -200,6 +202,28 @@ def _build_weight_tensor(class_weights, n_classes, device):
     return weights.to(device)
 
 
+def _save_dl_checkpoint(path, model, meta, epoch, val_macro_f1):
+    """Write a self-contained DL checkpoint that ``load_dl_checkpoint`` can reload.
+
+    ``meta`` carries the architecture config + training normalizer (model name,
+    context, channels, modalities, max_len, mean, std) so the exact model can be
+    rebuilt later; ``epoch`` and ``val_macro_f1`` record where in training this
+    snapshot was taken. ``temperature`` is a placeholder (1.0) because temperature
+    scaling is only fitted after training — the final calibrated checkpoint saved
+    by run_dl.py carries the real value.
+    """
+    path = Path(path)
+    ensure_dir(path.parent)
+    payload = dict(meta or {})
+    payload.update({
+        "state_dict": {name: tensor.cpu() for name, tensor in model.state_dict().items()},
+        "epoch": int(epoch),
+        "val_macro_f1": float(val_macro_f1),
+    })
+    payload.setdefault("temperature", 1.0)
+    torch.save(payload, path)
+
+
 def evaluate_dl(model, loader, device="cpu"):
     """Run the model over a DataLoader and return the metric dict."""
     model.eval()
@@ -230,7 +254,8 @@ def predict_logits_dl(model, loader, device="cpu"):
 
 def train_dl(model, train_loader, val_loader, epochs=20, lr=1e-3,
              class_weights=None, use_focal=False, device="cpu", patience=None,
-             weight_decay=0.0, focal_gamma=2.0):
+             weight_decay=0.0, focal_gamma=2.0,
+             checkpoint_dir=None, checkpoint_every=3, checkpoint_meta=None):
     """Train a deep model and keep the weights with the best validation macro-F1.
 
     Model selection is on validation macro-F1, so the returned model is the best
@@ -245,8 +270,16 @@ def train_dl(model, train_loader, val_loader, epochs=20, lr=1e-3,
     for the big speed-up. ``weight_decay`` (Adam L2) and ``focal_gamma`` are the
     training hyperparameters the search routines tune.
 
+    Checkpointing: when ``checkpoint_dir`` is given, a reloadable snapshot is
+    written every ``checkpoint_every`` epochs as ``epoch_NNN.pt`` (set
+    ``checkpoint_every=0`` to skip the periodic ones), and ``last.pt`` / ``best.pt``
+    are kept up to date every epoch so a disconnected run can resume and the best
+    weights survive a crash. ``checkpoint_meta`` (architecture config + normalizer)
+    is embedded so each file can be rebuilt by ``load_dl_checkpoint``.
+
     Returns (model, history); history has per-epoch train loss and val macro-F1.
     """
+    checkpoint_dir = Path(checkpoint_dir) if checkpoint_dir is not None else None
     model = model.to(device)
     weight_tensor = None
     if class_weights is not None:
@@ -283,12 +316,23 @@ def train_dl(model, train_loader, val_loader, epochs=20, lr=1e-3,
             "train_loss": epoch_loss / len(train_loader),
             "val_macro_f1": val_metrics["macro_f1"],
         })
-        if val_metrics["macro_f1"] > best_macro_f1:
+        improved = val_metrics["macro_f1"] > best_macro_f1
+        if improved:
             best_macro_f1 = val_metrics["macro_f1"]
             best_state = {name: tensor.cpu().clone() for name, tensor in model.state_dict().items()}
             epochs_without_improvement = 0
         else:
             epochs_without_improvement += 1
+
+        if checkpoint_dir is not None:
+            val_f1 = val_metrics["macro_f1"]
+            if checkpoint_every and (epoch + 1) % checkpoint_every == 0:
+                _save_dl_checkpoint(checkpoint_dir / f"epoch_{epoch + 1:03d}.pt",
+                                    model, checkpoint_meta, epoch + 1, val_f1)
+            _save_dl_checkpoint(checkpoint_dir / "last.pt", model, checkpoint_meta, epoch + 1, val_f1)
+            if improved:  # model currently holds the best weights
+                _save_dl_checkpoint(checkpoint_dir / "best.pt", model, checkpoint_meta, epoch + 1, val_f1)
+
         epoch_bar.set_postfix(train_loss=f"{epoch_loss / len(train_loader):.3f}",
                               val_f1=f"{val_metrics['macro_f1']:.3f}",
                               best_f1=f"{best_macro_f1:.3f}",
@@ -304,23 +348,30 @@ def train_dl(model, train_loader, val_loader, epochs=20, lr=1e-3,
 
 
 def random_search_dl(model_factory, train_loader, val_loader, n_trials=6, epochs=10,
-                     class_weights=None, seed=42, patience=None, device="cpu"):
+                     class_weights=None, seed=42, patience=None, device="cpu",
+                     checkpoint_dir=None, checkpoint_every=3, checkpoint_meta=None):
     """Random search over learning rate and loss type (validation macro-F1).
 
     model_factory is a zero-argument callable returning a fresh model. ``patience``
     is forwarded to ``train_dl`` so each trial can stop early once its validation
     macro-F1 plateaus. Kept as a dependency-free fallback for ``bayesian_search_dl``.
-    Returns (best, trials): best has the trained model plus its hyperparameters.
+    When ``checkpoint_dir`` is given each trial checkpoints into its own
+    ``trial_NN/`` subfolder. Returns (best, trials): best has the trained model plus
+    its hyperparameters.
     """
     rng = np.random.default_rng(seed)
     learning_rates = [1e-2, 3e-3, 1e-3, 3e-4]
     best, trials = None, []
-    for _ in tqdm(range(n_trials), desc="Random search", unit="trial"):
+    for trial_number in tqdm(range(n_trials), desc="Random search", unit="trial"):
         lr = float(rng.choice(learning_rates))
         use_focal = bool(rng.integers(0, 2))
+        trial_ckpt = (Path(checkpoint_dir) / f"trial_{trial_number:02d}"
+                      if checkpoint_dir is not None else None)
         model, history = train_dl(model_factory(), train_loader, val_loader, epochs=epochs, lr=lr,
                                   class_weights=class_weights, use_focal=use_focal,
-                                  patience=patience, device=device)
+                                  patience=patience, device=device,
+                                  checkpoint_dir=trial_ckpt, checkpoint_every=checkpoint_every,
+                                  checkpoint_meta=checkpoint_meta)
         score = max(step["val_macro_f1"] for step in history)
         trials.append({"lr": lr, "use_focal": use_focal, "val_macro_f1": score})
         if best is None or score > best["val_macro_f1"]:
@@ -330,7 +381,8 @@ def random_search_dl(model_factory, train_loader, val_loader, n_trials=6, epochs
 
 
 def bayesian_search_dl(model_factory, train_loader, val_loader, n_trials=15, epochs=10,
-                       class_weights=None, seed=42, patience=None, device="cpu"):
+                       class_weights=None, seed=42, patience=None, device="cpu",
+                       checkpoint_dir=None, checkpoint_every=3, checkpoint_meta=None):
     """Bayesian optimization (Optuna TPE) over DL training hyperparameters.
 
     The master plan asks for Bayesian optimization rather than grid/random search
@@ -359,7 +411,9 @@ def bayesian_search_dl(model_factory, train_loader, val_loader, n_trials=15, epo
                       RuntimeWarning)
         return random_search_dl(model_factory, train_loader, val_loader, n_trials=n_trials,
                                 epochs=epochs, class_weights=class_weights, seed=seed,
-                                patience=patience, device=device)
+                                patience=patience, device=device,
+                                checkpoint_dir=checkpoint_dir, checkpoint_every=checkpoint_every,
+                                checkpoint_meta=checkpoint_meta)
 
     optuna.logging.set_verbosity(optuna.logging.WARNING)
     best = {"val_macro_f1": -1.0}
@@ -371,10 +425,14 @@ def bayesian_search_dl(model_factory, train_loader, val_loader, n_trials=15, epo
         weight_decay = trial.suggest_float("weight_decay", 1e-6, 1e-3, log=True)
         use_focal = trial.suggest_categorical("use_focal", [False, True])
         focal_gamma = trial.suggest_float("focal_gamma", 1.0, 3.0) if use_focal else 2.0
+        trial_ckpt = (Path(checkpoint_dir) / f"trial_{trial.number:02d}"
+                      if checkpoint_dir is not None else None)
         model, history = train_dl(model_factory(), train_loader, val_loader, epochs=epochs, lr=lr,
                                   weight_decay=weight_decay, class_weights=class_weights,
                                   use_focal=use_focal, focal_gamma=focal_gamma,
-                                  patience=patience, device=device)
+                                  patience=patience, device=device,
+                                  checkpoint_dir=trial_ckpt, checkpoint_every=checkpoint_every,
+                                  checkpoint_meta=checkpoint_meta)
         score = max(step["val_macro_f1"] for step in history)
         record = {"lr": lr, "weight_decay": weight_decay, "use_focal": use_focal,
                   "focal_gamma": focal_gamma, "val_macro_f1": score}

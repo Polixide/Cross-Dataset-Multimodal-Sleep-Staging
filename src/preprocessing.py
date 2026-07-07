@@ -9,6 +9,7 @@ The label mapping and normalization functions are implemented and tested,
 because they are the leakage-sensitive parts of the pipeline.
 """
 import numpy as np
+from tqdm.auto import tqdm
 
 from src.utils import STAGE_TO_INDEX
 
@@ -140,7 +141,9 @@ def fit_normalizer_streaming(x, indices=None, chunk_size=4096):
     channel_sum = np.zeros(n_channels, dtype=np.float64)
     channel_sumsq = np.zeros(n_channels, dtype=np.float64)
     total = 0
-    for start in range(0, len(indices), chunk_size):
+    n_chunks = (len(indices) + chunk_size - 1) // chunk_size
+    for start in tqdm(range(0, len(indices), chunk_size), total=n_chunks,
+                      desc="Fitting normalizer", unit="chunk"):
         chunk = np.asarray(x[indices[start:start + chunk_size]], dtype=np.float64)
         channel_sum += chunk.sum(axis=(0, 2))
         channel_sumsq += (chunk ** 2).sum(axis=(0, 2))
