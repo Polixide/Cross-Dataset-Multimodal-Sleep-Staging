@@ -77,14 +77,25 @@ python scripts/analyze_features.py --data data/processed/sleep_edf.npz
 python scripts/run_ml.py --data data/processed/sleep_edf.npz --model rf --feature-selection
 
 # 4. Deep learning — Cross-Modal Transformer with temporal context
-#    (auto-uses a GPU when present; add --tune for Bayesian hyperparameter search)
+#    (auto-uses a GPU when present; add --tune for Bayesian hyperparameter search.
+#     The Transformer auto-enables a warmup+cosine LR schedule; checkpoints land in
+#     results/checkpoints/. Overlap training windows with --seq-stride when context>1.)
 python scripts/run_dl.py --data data/processed/sleep_edf.npz --model transformer --context 11
 python scripts/run_dl.py --data data/processed/sleep_edf.npz --model transformer --context 15 \
-    --tune --search-method bayes --num-workers 2
+    --tune --search-method bayes --num-workers 2 --seq-stride 7
 # On Colab GPU: run notebooks/05_colab_dl_benchmark.ipynb (Sleep-EDF benchmark sweep)
 
 # 5. External validation on a second dataset (frozen model)
 python scripts/run_external.py --model-path results/logs/ml_model.pkl --external data/processed/hmc.npz
+#    DL: evaluate a saved checkpoint on HMC (no retrain) — outputs match the internal
+#    format, so make_figures.py renders the full HMC figure set for that model
+python scripts/eval_dl_external.py --checkpoint results/logs/dl_cnn_lstm_ctx15.pt \
+    --external data/processed/hmc.npz \
+    --out results/tables/dl_cnn_lstm_ctx15_hmc.json \
+    --probs-out results/logs/dl_cnn_lstm_ctx15_hmc_probs.npz
+python scripts/make_figures.py --metrics results/tables/dl_cnn_lstm_ctx15_hmc.json \
+    --probs results/logs/dl_cnn_lstm_ctx15_hmc_probs.npz \
+    --data data/processed/hmc.npz --out-dir results/figures/cnn_lstm_ctx15_hmc
 ```
 
 ## Tests
@@ -112,9 +123,15 @@ The full pipeline is implemented and tested:
 - **Models:** feature-based ML (SVM, RF, gradient boosting, logistic — scaled
   where needed) and deep learning (1D-CNN, CNN-LSTM, and the Cross-Modal
   Transformer with modality masking for ablations and missing-modality tests).
+  The Transformer's modality encoders emit several temporal tokens per epoch (with
+  modality + within-epoch positional embeddings), so transient events (spindles,
+  K-complexes, eye movements) reach the cross-modal attention instead of being
+  averaged away.
 - **Temporal context:** `--context N` turns any DL model into a hierarchical
   sequence model over N neighboring epochs (one label per epoch), with the
-  single-epoch models kept as the with/without-context baseline.
+  single-epoch models kept as the with/without-context baseline. `--seq-stride`
+  overlaps the *training* windows as augmentation (more sequences); validation and
+  test windows stay non-overlapping so every held-out epoch is scored once.
 - **Memory:** the DL runner streams training statistics off the memmap
   (`fit_normalizer_streaming`) and reads epochs lazily per item
   (`MemmapEpochDataset`), so it trains on the full Sleep-EDF set (~22 GB of
@@ -123,7 +140,16 @@ The full pipeline is implemented and tested:
   balanced mini-batches (DL).
 - **Tuning:** grid search (ML) and, for DL, Bayesian optimization (Optuna TPE over
   learning rate / weight decay / loss / focal gamma, `--tune --search-method bayes`)
-  with random search kept as a fallback, all subject-wise.
+  with random search kept as a fallback, all subject-wise. The search prunes
+  clearly-losing trials early (median pruning on the validation macro-F1 curve), so
+  15–20 trials stay affordable. The Transformer additionally trains with a warmup +
+  cosine learning-rate schedule (`--scheduler auto`) for stability — Optuna picks the
+  peak LR, the schedule shapes it over training — while the CNN baselines keep a
+  constant rate.
+- **Checkpointing:** DL runs save periodic checkpoints (`--checkpoint-every`, default
+  every 3 epochs) plus `best.pt` / `last.pt` per training, and a final calibrated
+  `final.pt`, organized under `results/checkpoints/<config>/`; each is self-contained
+  (architecture + normalizer + temperature) and reloadable via `load_dl_checkpoint`.
 - **Compute:** DL runs on GPU automatically (`--device auto`); `--num-workers`
   parallelizes the memmap reads. A ready-to-run Colab notebook for the Sleep-EDF
   DL benchmark sweep is in `notebooks/05_colab_dl_benchmark.ipynb`.
@@ -133,7 +159,9 @@ The full pipeline is implemented and tested:
   temperature scaling (DL) — with reliability diagrams.
 - **Explainability:** SHAP (ML) and Grad-CAM (DL).
 - **Validation:** internal held-out test, external cross-dataset validation, and
-  LOSO robustness; figures via `make_figures.py`.
+  LOSO robustness; figures via `make_figures.py`, including two-panel learning
+  curves (train-vs-val loss and train-vs-val macro-F1 on shared axes) for the
+  overfitting analysis.
 
 The data-preparation scripts (`prepare_sleep_edf.py`, `prepare_hmc.py`) follow
 the standard dataset formats and need the actual datasets in `data/raw/` to run.

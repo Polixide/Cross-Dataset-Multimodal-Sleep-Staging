@@ -68,23 +68,31 @@ class CNNLSTM(nn.Module):
 
 
 class ModalityEncoder(nn.Module):
-    """Lightweight 1D-CNN that encodes one modality's channels into a d_model token."""
+    """Lightweight 1D-CNN that encodes one modality into ``n_tokens`` temporal tokens.
 
-    def __init__(self, in_channels, d_model):
+    Keeps ``n_tokens`` time steps (``AdaptiveAvgPool1d(n_tokens)``) instead of
+    collapsing the whole 30 s epoch to a single value. This preserves the transient,
+    stage-discriminative events (sleep spindles, K-complexes, eye movements) that a
+    global average would wash out, so the cross-modal attention can locate *when*
+    within the epoch each modality is informative. Returns (batch, n_tokens, d_model).
+    """
+
+    def __init__(self, in_channels, d_model, n_tokens=4):
         super().__init__()
+        self.n_tokens = n_tokens
         self.cnn = nn.Sequential(
             nn.Conv1d(in_channels, 16, kernel_size=7, padding=3),
             nn.ReLU(),
             nn.MaxPool1d(4),
             nn.Conv1d(16, 32, kernel_size=7, padding=3),
             nn.ReLU(),
-            nn.AdaptiveAvgPool1d(1),
+            nn.AdaptiveAvgPool1d(n_tokens),
         )
         self.project = nn.Linear(32, d_model)
 
     def forward(self, x):
-        features = self.cnn(x).squeeze(-1)
-        return self.project(features)
+        features = self.cnn(x).transpose(1, 2)   # (batch, n_tokens, 32)
+        return self.project(features)            # (batch, n_tokens, d_model)
 
 
 class CrossModalTransformer(nn.Module):
@@ -97,20 +105,25 @@ class CrossModalTransformer(nn.Module):
     """
 
     def __init__(self, modality_channels=None, n_classes=5, d_model=64, n_heads=4,
-                 n_layers=2, dropout=0.2, active_modalities=None):
+                 n_layers=2, dropout=0.2, active_modalities=None, n_tokens=4):
         super().__init__()
         self.n_classes = n_classes
         self.embed_dim = d_model
+        self.n_tokens = n_tokens
         self.modality_channels = modality_channels or MODALITY_CHANNELS
         self.modality_names = list(self.modality_channels)
         self.active_modalities = active_modalities or list(self.modality_names)
 
         self.encoders = nn.ModuleDict({
-            name: ModalityEncoder(len(channels), d_model)
+            name: ModalityEncoder(len(channels), d_model, n_tokens=n_tokens)
             for name, channels in self.modality_channels.items()
         })
         self.cls_token = nn.Parameter(torch.zeros(1, 1, d_model))
+        # One embedding per token slot: index 0 = CLS, 1..n = the modalities.
         self.modality_embedding = nn.Parameter(torch.zeros(1, len(self.modality_names) + 1, d_model))
+        # Within-epoch position of each modality token (the n_tokens are ordered in time,
+        # so attention needs a positional signal to tell early from late in the epoch).
+        self.token_positional = nn.Parameter(torch.zeros(1, n_tokens, d_model))
 
         encoder_layer = nn.TransformerEncoderLayer(
             d_model, n_heads, dim_feedforward=2 * d_model, dropout=dropout, batch_first=True
@@ -126,20 +139,29 @@ class CrossModalTransformer(nn.Module):
         )
 
     def encode(self, x, active_modalities=None):
-        """Return the fused CLS embedding (batch, d_model)."""
+        """Return the fused CLS embedding (batch, d_model).
+
+        Each modality contributes ``n_tokens`` temporal tokens (not one), tagged with a
+        modality embedding and a within-epoch positional embedding; a CLS token gathers
+        the fused representation. Inactive modalities are masked out (all their tokens),
+        which is what the ablation / missing-modality experiments rely on.
+        """
         active = active_modalities or self.active_modalities
         batch = x.shape[0]
         device = x.device
 
-        tokens = [self.cls_token.expand(batch, -1, -1)]
+        cls = self.cls_token.expand(batch, -1, -1) + self.modality_embedding[:, :1, :]
+        tokens = [cls]
         padding = [torch.zeros(batch, 1, dtype=torch.bool, device=device)]
-        for name in self.modality_names:
+        for i, name in enumerate(self.modality_names):
             channels = self.modality_channels[name]
-            token = self.encoders[name](x[:, channels, :]).unsqueeze(1)
-            tokens.append(token)
-            padding.append(torch.full((batch, 1), name not in active, dtype=torch.bool, device=device))
+            token_group = self.encoders[name](x[:, channels, :])  # (batch, n_tokens, d_model)
+            token_group = token_group + self.modality_embedding[:, i + 1:i + 2, :] + self.token_positional
+            tokens.append(token_group)
+            padding.append(torch.full((batch, token_group.shape[1]), name not in active,
+                                      dtype=torch.bool, device=device))
 
-        tokens = torch.cat(tokens, dim=1) + self.modality_embedding
+        tokens = torch.cat(tokens, dim=1)
         key_padding_mask = torch.cat(padding, dim=1)
         encoded = self.transformer(tokens, src_key_padding_mask=key_padding_mask)
         return encoded[:, 0]

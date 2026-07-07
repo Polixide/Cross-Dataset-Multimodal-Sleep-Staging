@@ -65,15 +65,18 @@ def evaluate_missing_modality(model, test_loader, device="cpu"):
     return results
 
 
-def build_split_dataset(x, y, subjects, split_idx, mean, std, context):
+def build_split_dataset(x, y, subjects, split_idx, mean, std, context, stride=None):
     """Build a lazy, memmap-backed dataset for one subject-wise split.
 
     Signals are read on the fly from the memmap and normalized per item, so the
     full array never enters RAM. With context > 1 the item indices are sequences
-    of consecutive within-subject epochs (temporal context).
+    of consecutive within-subject epochs (temporal context). ``stride`` < context
+    makes the windows OVERLAP (more sequences); use it on the training split only as
+    augmentation, and keep val/test non-overlapping (stride=context) so every test
+    epoch is scored exactly once.
     """
     if context > 1:
-        item_index = build_sequence_windows(subjects, split_idx, context)
+        item_index = build_sequence_windows(subjects, split_idx, context, stride=stride)
     else:
         item_index = np.asarray(split_idx)
     return MemmapEpochDataset(x, y, item_index, mean, std, context=context)
@@ -85,6 +88,11 @@ def main():
     parser.add_argument("--model", default="cnn", choices=["cnn", "cnn_lstm", "transformer"])
     parser.add_argument("--context", type=int, default=1,
                         help="Epochs per sequence (>1 enables temporal context).")
+    parser.add_argument("--seq-stride", type=int, default=None,
+                        help="Stride (epochs) for TRAINING sequence windows when context>1. "
+                             "Smaller than context => overlapping windows (more training "
+                             "sequences); defaults to context (non-overlapping). Val/test always "
+                             "use non-overlapping windows.")
     parser.add_argument("--modalities", nargs="+", default=["eeg", "eog", "emg"],
                         choices=["eeg", "eog", "emg"], help="Active modalities (transformer only).")
     parser.add_argument("--epochs", type=int, default=20)
@@ -100,6 +108,12 @@ def main():
                              "the master-plan strategy) or 'random'.")
     parser.add_argument("--n-trials", type=int, default=15,
                         help="Number of search trials when --tune is set.")
+    parser.add_argument("--scheduler", default="auto", choices=["auto", "none", "cosine"],
+                        help="LR schedule. 'cosine' = linear warmup then cosine decay; 'auto' uses "
+                             "cosine for the Transformer (which needs it to stay stable) and none "
+                             "otherwise.")
+    parser.add_argument("--warmup-epochs", type=int, default=2,
+                        help="Warmup epochs for the cosine scheduler.")
     parser.add_argument("--device", default="auto", choices=["auto", "cuda", "cpu"],
                         help="Compute device. 'auto' uses CUDA when available (e.g. Colab GPU).")
     parser.add_argument("--num-workers", type=int, default=0,
@@ -150,7 +164,10 @@ def main():
     # memmap so the full (tens-of-GB) signal array is never materialized in RAM.
     mean, std = fit_normalizer_streaming(dataset.x, train_idx)
 
-    train_ds = build_split_dataset(dataset.x, dataset.y, subjects, train_idx, mean, std, args.context)
+    # Training windows may overlap (--seq-stride) as augmentation; val/test stay
+    # non-overlapping so each held-out epoch is scored exactly once.
+    train_ds = build_split_dataset(dataset.x, dataset.y, subjects, train_idx, mean, std,
+                                   args.context, stride=args.seq_stride)
     val_ds = build_split_dataset(dataset.x, dataset.y, subjects, val_idx, mean, std, args.context)
     test_ds = build_split_dataset(dataset.x, dataset.y, subjects, test_idx, mean, std, args.context)
 
@@ -181,15 +198,24 @@ def main():
         "max_len": max(args.context, 8), "mean": mean, "std": std,
     }
 
+    # Resolve the LR schedule: Transformers get warmup+cosine by default (they need it
+    # to train stably), the CNN baselines keep their plain constant LR.
+    scheduler = ("cosine" if args.model == "transformer" else "none") if args.scheduler == "auto" \
+        else args.scheduler
+    scheduler = None if scheduler == "none" else scheduler
+    logger.info("LR scheduler: %s (warmup %d epochs).", scheduler or "none", args.warmup_epochs)
+
     output = {"model": args.model, "context": args.context, "modalities": args.modalities,
-              "loss": args.loss, "device": device}
+              "loss": args.loss, "device": device, "scheduler": scheduler or "none",
+              "seq_stride": args.seq_stride}
     if args.tune:
         search = bayesian_search_dl if args.search_method == "bayes" else random_search_dl
         best, trials = search(model_factory, train_loader, val_loader, n_trials=args.n_trials,
                               epochs=args.epochs, class_weights=class_weights,
                               patience=args.patience, device=device,
                               checkpoint_dir=checkpoint_root, checkpoint_every=args.checkpoint_every,
-                              checkpoint_meta=checkpoint_meta)
+                              checkpoint_meta=checkpoint_meta,
+                              scheduler=scheduler, warmup_epochs=args.warmup_epochs)
         model = best["model"]
         best_summary = {k: best[k] for k in best if k not in ("model", "history")}
         output["tuning"] = {"method": args.search_method, "best": best_summary, "trials": trials}
@@ -203,7 +229,8 @@ def main():
                                   class_weights=class_weights, use_focal=(args.loss == "focal"),
                                   patience=args.patience, device=device,
                                   checkpoint_dir=checkpoint_root / "train",
-                                  checkpoint_every=args.checkpoint_every, checkpoint_meta=checkpoint_meta)
+                                  checkpoint_every=args.checkpoint_every, checkpoint_meta=checkpoint_meta,
+                                  scheduler=scheduler, warmup_epochs=args.warmup_epochs)
         output["history"] = history
 
     # Temperature scaling on validation, then evaluate on the held-out test.

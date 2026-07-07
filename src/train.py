@@ -8,6 +8,7 @@
 Random search is used for the DL model instead of Bayesian optimization to avoid
 an extra dependency; it can be swapped for optuna without changing the callers.
 """
+import math
 import warnings
 from pathlib import Path
 
@@ -275,10 +276,31 @@ def predict_logits_dl(model, loader, device="cpu"):
     return np.concatenate(y_true), np.concatenate(logits)
 
 
+def _build_lr_scheduler(optimizer, scheduler, epochs, warmup_epochs):
+    """Optional per-epoch LR schedule. ``scheduler='cosine'`` does a linear warmup
+    for ``warmup_epochs`` then cosine-decays to ~0 over the remaining epochs.
+
+    Warmup + cosine is the standard recipe that keeps Transformer training stable
+    (a constant high LR makes attention layers diverge early), while leaving the CNN
+    baselines unchanged when ``scheduler`` is None.
+    """
+    if scheduler != "cosine":
+        return None
+
+    def lr_lambda(current_epoch):
+        if warmup_epochs and current_epoch < warmup_epochs:
+            return float(current_epoch + 1) / float(warmup_epochs)
+        progress = (current_epoch - warmup_epochs) / max(1, epochs - warmup_epochs)
+        return 0.5 * (1.0 + math.cos(math.pi * min(1.0, progress)))
+
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+
 def train_dl(model, train_loader, val_loader, epochs=20, lr=1e-3,
              class_weights=None, use_focal=False, device="cpu", patience=None,
              weight_decay=0.0, focal_gamma=2.0,
-             checkpoint_dir=None, checkpoint_every=3, checkpoint_meta=None):
+             checkpoint_dir=None, checkpoint_every=3, checkpoint_meta=None,
+             scheduler=None, warmup_epochs=0, epoch_callback=None):
     """Train a deep model and keep the weights with the best validation macro-F1.
 
     Model selection is on validation macro-F1, so the returned model is the best
@@ -300,7 +322,12 @@ def train_dl(model, train_loader, val_loader, epochs=20, lr=1e-3,
     weights survive a crash. ``checkpoint_meta`` (architecture config + normalizer)
     is embedded so each file can be rebuilt by ``load_dl_checkpoint``.
 
-    Returns (model, history); history has per-epoch train loss and val macro-F1.
+    ``scheduler='cosine'`` + ``warmup_epochs`` enables LR warmup then cosine decay
+    (stabilizes the Transformer). ``epoch_callback(epoch, val_macro_f1)`` is called
+    after every epoch; it may raise (e.g. ``optuna.TrialPruned``) to abort a trial
+    early, which is how the Bayesian search prunes unpromising runs.
+
+    Returns (model, history); history has per-epoch train/val loss and macro-F1.
     """
     checkpoint_dir = Path(checkpoint_dir) if checkpoint_dir is not None else None
     model = model.to(device)
@@ -311,6 +338,7 @@ def train_dl(model, train_loader, val_loader, epochs=20, lr=1e-3,
     criterion = (FocalLoss(gamma=focal_gamma, weight=weight_tensor)
                  if use_focal else torch.nn.CrossEntropyLoss(weight=weight_tensor))
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+    lr_scheduler = _build_lr_scheduler(optimizer, scheduler, epochs, warmup_epochs)
 
     history = []
     best_macro_f1 = -1.0
@@ -366,10 +394,16 @@ def train_dl(model, train_loader, val_loader, epochs=20, lr=1e-3,
             if improved:  # model currently holds the best weights
                 _save_dl_checkpoint(checkpoint_dir / "best.pt", model, checkpoint_meta, epoch + 1, val_f1)
 
+        if lr_scheduler is not None:
+            lr_scheduler.step()
+
         epoch_bar.set_postfix(train_loss=f"{epoch_loss / len(train_loader):.3f}",
                               val_f1=f"{val_metrics['macro_f1']:.3f}",
                               best_f1=f"{best_macro_f1:.3f}",
                               stale=epochs_without_improvement)
+        # Let the caller (e.g. an Optuna trial) inspect progress and abort early.
+        if epoch_callback is not None:
+            epoch_callback(epoch, val_metrics["macro_f1"])
         if patience is not None and epochs_without_improvement >= patience:
             epoch_bar.write(f"Early stopping at epoch {epoch + 1}/{epochs}: val macro-F1 did not "
                             f"improve for {patience} epoch(s) (best {best_macro_f1:.3f}).")
@@ -382,7 +416,8 @@ def train_dl(model, train_loader, val_loader, epochs=20, lr=1e-3,
 
 def random_search_dl(model_factory, train_loader, val_loader, n_trials=6, epochs=10,
                      class_weights=None, seed=42, patience=None, device="cpu",
-                     checkpoint_dir=None, checkpoint_every=3, checkpoint_meta=None):
+                     checkpoint_dir=None, checkpoint_every=3, checkpoint_meta=None,
+                     scheduler=None, warmup_epochs=0):
     """Random search over learning rate and loss type (validation macro-F1).
 
     model_factory is a zero-argument callable returning a fresh model. ``patience``
@@ -404,7 +439,8 @@ def random_search_dl(model_factory, train_loader, val_loader, n_trials=6, epochs
                                   class_weights=class_weights, use_focal=use_focal,
                                   patience=patience, device=device,
                                   checkpoint_dir=trial_ckpt, checkpoint_every=checkpoint_every,
-                                  checkpoint_meta=checkpoint_meta)
+                                  checkpoint_meta=checkpoint_meta,
+                                  scheduler=scheduler, warmup_epochs=warmup_epochs)
         score = max(step["val_macro_f1"] for step in history)
         trials.append({"lr": lr, "use_focal": use_focal, "val_macro_f1": score})
         if best is None or score > best["val_macro_f1"]:
@@ -415,7 +451,8 @@ def random_search_dl(model_factory, train_loader, val_loader, n_trials=6, epochs
 
 def bayesian_search_dl(model_factory, train_loader, val_loader, n_trials=15, epochs=10,
                        class_weights=None, seed=42, patience=None, device="cpu",
-                       checkpoint_dir=None, checkpoint_every=3, checkpoint_meta=None):
+                       checkpoint_dir=None, checkpoint_every=3, checkpoint_meta=None,
+                       scheduler=None, warmup_epochs=0):
     """Bayesian optimization (Optuna TPE) over DL training hyperparameters.
 
     The master plan asks for Bayesian optimization rather than grid/random search
@@ -446,7 +483,8 @@ def bayesian_search_dl(model_factory, train_loader, val_loader, n_trials=15, epo
                                 epochs=epochs, class_weights=class_weights, seed=seed,
                                 patience=patience, device=device,
                                 checkpoint_dir=checkpoint_dir, checkpoint_every=checkpoint_every,
-                                checkpoint_meta=checkpoint_meta)
+                                checkpoint_meta=checkpoint_meta,
+                                scheduler=scheduler, warmup_epochs=warmup_epochs)
 
     optuna.logging.set_verbosity(optuna.logging.WARNING)
     best = {"val_macro_f1": -1.0}
@@ -460,12 +498,22 @@ def bayesian_search_dl(model_factory, train_loader, val_loader, n_trials=15, epo
         focal_gamma = trial.suggest_float("focal_gamma", 1.0, 3.0) if use_focal else 2.0
         trial_ckpt = (Path(checkpoint_dir) / f"trial_{trial.number:02d}"
                       if checkpoint_dir is not None else None)
+
+        # Report each epoch to Optuna so the MedianPruner can abort clearly-losing
+        # trials early — this is what makes running 15-20 trials affordable.
+        def prune_callback(epoch, val_macro_f1):
+            trial.report(val_macro_f1, epoch)
+            if trial.should_prune():
+                raise optuna.TrialPruned()
+
         model, history = train_dl(model_factory(), train_loader, val_loader, epochs=epochs, lr=lr,
                                   weight_decay=weight_decay, class_weights=class_weights,
                                   use_focal=use_focal, focal_gamma=focal_gamma,
                                   patience=patience, device=device,
                                   checkpoint_dir=trial_ckpt, checkpoint_every=checkpoint_every,
-                                  checkpoint_meta=checkpoint_meta)
+                                  checkpoint_meta=checkpoint_meta,
+                                  scheduler=scheduler, warmup_epochs=warmup_epochs,
+                                  epoch_callback=prune_callback)
         score = max(step["val_macro_f1"] for step in history)
         record = {"lr": lr, "weight_decay": weight_decay, "use_focal": use_focal,
                   "focal_gamma": focal_gamma, "val_macro_f1": score}
@@ -474,8 +522,14 @@ def bayesian_search_dl(model_factory, train_loader, val_loader, n_trials=15, epo
             best = {"model": model, "history": history, **record}
         return score
 
-    study = optuna.create_study(direction="maximize", sampler=optuna.samplers.TPESampler(seed=seed))
+    # TPE leaves its random-startup phase after a few trials, then models the search
+    # space; MedianPruner stops trials whose curve is below the running median.
+    sampler = optuna.samplers.TPESampler(seed=seed, n_startup_trials=min(5, n_trials))
+    pruner = optuna.pruners.MedianPruner(n_startup_trials=3, n_warmup_steps=3)
+    study = optuna.create_study(direction="maximize", sampler=sampler, pruner=pruner)
     study.optimize(objective, n_trials=n_trials, show_progress_bar=True)
+    if "model" not in best:
+        raise RuntimeError("All Bayesian trials were pruned; increase n_trials or relax pruning.")
     return best, trials
 
 
