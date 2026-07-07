@@ -237,6 +237,29 @@ def evaluate_dl(model, loader, device="cpu"):
     return compute_metrics(np.concatenate(y_true), np.concatenate(y_pred))
 
 
+def _validate_with_loss(model, loader, criterion, device="cpu"):
+    """One pass over ``loader``: mean loss under ``criterion`` + the metric dict.
+
+    Computed in a single read of the split (no extra pass over evaluate_dl), so the
+    learning-curve figure can show train-vs-val loss AND train-vs-val macro-F1 for
+    the overfitting slide without slowing training. Returns (mean_loss, metrics).
+    """
+    model.eval()
+    total_loss, n_batches = 0.0, 0
+    y_true, y_pred = [], []
+    with torch.no_grad():
+        for x_batch, y_batch in loader:
+            logits = model(x_batch.to(device))
+            flat_logits = logits.reshape(-1, logits.shape[-1])
+            flat_target = y_batch.reshape(-1).to(device)
+            total_loss += criterion(flat_logits, flat_target).item()
+            n_batches += 1
+            y_pred.append(flat_logits.argmax(dim=-1).cpu().numpy())
+            y_true.append(y_batch.reshape(-1).numpy())
+    metrics = compute_metrics(np.concatenate(y_true), np.concatenate(y_pred))
+    return total_loss / max(n_batches, 1), metrics
+
+
 def predict_logits_dl(model, loader, device="cpu"):
     """Return (y_true, logits) as numpy arrays for the whole loader.
 
@@ -297,6 +320,7 @@ def train_dl(model, train_loader, val_loader, epochs=20, lr=1e-3,
     for epoch in epoch_bar:
         model.train()
         epoch_loss = 0.0
+        train_true, train_pred = [], []
         batch_bar = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{epochs}", unit="batch", leave=False)
         for x_batch, y_batch in batch_bar:
             x_batch = x_batch.to(device, non_blocking=True)
@@ -304,16 +328,25 @@ def train_dl(model, train_loader, val_loader, epochs=20, lr=1e-3,
             optimizer.zero_grad()
             logits = model(x_batch)
             # reshape unifies per-epoch (batch, C) and sequence (batch, seq_len, C) outputs.
-            loss = criterion(logits.reshape(-1, logits.shape[-1]), y_batch.reshape(-1))
+            flat_logits = logits.reshape(-1, logits.shape[-1])
+            flat_target = y_batch.reshape(-1)
+            loss = criterion(flat_logits, flat_target)
             loss.backward()
             optimizer.step()
             epoch_loss += loss.item()
+            # Online train macro-F1: reuse these forward passes (like train_loss is a
+            # running average) so no extra pass over the training split is needed.
+            train_pred.append(flat_logits.detach().argmax(dim=-1).cpu().numpy())
+            train_true.append(flat_target.detach().cpu().numpy())
             batch_bar.set_postfix(loss=f"{loss.item():.3f}")
 
-        val_metrics = evaluate_dl(model, val_loader, device)
+        train_macro_f1 = compute_metrics(np.concatenate(train_true), np.concatenate(train_pred))["macro_f1"]
+        val_loss, val_metrics = _validate_with_loss(model, val_loader, criterion, device)
         history.append({
             "epoch": epoch,
             "train_loss": epoch_loss / len(train_loader),
+            "train_macro_f1": train_macro_f1,
+            "val_loss": val_loss,
             "val_macro_f1": val_metrics["macro_f1"],
         })
         improved = val_metrics["macro_f1"] > best_macro_f1

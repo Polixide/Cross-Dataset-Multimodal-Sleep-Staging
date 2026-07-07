@@ -121,11 +121,49 @@ def plot_reliability(y_true, y_prob, out_path):
 
 
 def plot_learning_curves(history, out_path):
+    """Learning curves for the overfitting slide.
+
+    When the history has train+val loss AND train+val macro-F1 (runs from the
+    updated train_dl), draw the canonical two-panel figure with each pair on a
+    SHARED axis, so the train-vs-val gap is directly readable. Older runs that only
+    logged train_loss + val_macro_f1 fall back to the legacy dual-axis single plot.
+    """
     epochs = [step["epoch"] for step in history]
+    has_val_loss = all("val_loss" in step for step in history)
+    has_train_f1 = all("train_macro_f1" in step for step in history)
+
+    if has_val_loss and has_train_f1:
+        fig, (ax_loss, ax_f1) = plt.subplots(1, 2, figsize=(11, 4))
+        ax_loss.plot(epochs, [s["train_loss"] for s in history], "C0-", label="Train")
+        ax_loss.plot(epochs, [s["val_loss"] for s in history], "C1-", label="Validation")
+        ax_loss.set_xlabel("Epoch")
+        ax_loss.set_ylabel("Loss")
+        ax_loss.set_title("Loss (lower is better)")
+        ax_loss.legend(fontsize=8)
+
+        ax_f1.plot(epochs, [s["train_macro_f1"] for s in history], "C0-", label="Train")
+        ax_f1.plot(epochs, [s["val_macro_f1"] for s in history], "C1-", label="Validation")
+        ax_f1.set_xlabel("Epoch")
+        ax_f1.set_ylabel("Macro-F1")
+        ax_f1.set_ylim(0, 1)
+        ax_f1.set_title("Macro-F1 (higher is better)")
+        ax_f1.legend(fontsize=8)
+
+        for ax in (ax_loss, ax_f1):  # one tick per epoch (integer labels)
+            ax.set_xticks(epochs)
+
+        fig.suptitle("Learning curves — train vs validation")
+        plt.tight_layout()
+        plt.savefig(out_path, dpi=150)
+        plt.close()
+        return
+
+    # Legacy fallback: older runs only logged train_loss + val_macro_f1.
     fig, ax_loss = plt.subplots(figsize=(6, 4))
     ax_loss.plot(epochs, [step["train_loss"] for step in history], "b-", label="Train loss")
     ax_loss.set_xlabel("Epoch")
     ax_loss.set_ylabel("Train loss", color="b")
+    ax_loss.set_xticks(epochs)  # one tick per epoch (integer labels)
     ax_f1 = ax_loss.twinx()
     ax_f1.plot(epochs, [step["val_macro_f1"] for step in history], "g-", label="Val macro-F1")
     ax_f1.set_ylabel("Val macro-F1", color="g")
