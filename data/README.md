@@ -11,10 +11,12 @@ data/
 ├── raw/         # original downloads, one subfolder per dataset (untracked)
 │   ├── sleep_edf/
 │   ├── hmc/
+│   ├── isruc/
 │   └── dreamt/
 ├── processed/   # model-ready .npz files produced by scripts/prepare_*.py
 │   ├── sleep_edf.npz
-│   └── hmc.npz
+│   ├── hmc.npz
+│   └── isruc.npz
 └── splits/      # saved subject-wise split indices for reproducibility
 ```
 
@@ -28,6 +30,12 @@ original subfolder structure (e.g. `data/raw/hmc/recordings/...`).
 - **HMC** — PhysioNet (Haaglanden Medisch Centrum sleep staging database); open
   access, no agreement. Needs the `SNxxx.edf` + `SNxxx_sleepscoring.edf` pairs.
   Used as the external test set.
+- **ISRUC-Sleep (Cohort I)** — University of Coimbra (sleeptight.isr.uc.pt); open
+  access. A second external PSG test set (100 single-session subjects). Each
+  subject folder holds `<subj>.rec` (EDF content) plus per-expert text hypnograms
+  `<subj>_1.txt` / `<subj>_2.txt` (one integer stage code per 30 s epoch).
+  Distributed as one `.rar` per subject — extract each into
+  `data/raw/isruc/<subject>/`.
 - **DREAMT** — PhysioNet (optional wearable extension; different modality, treated
   as future work).
 
@@ -50,6 +58,11 @@ the files inside it), extracts Sleep-EDF into `data/raw/sleep_edf/` and HMC into
 `data/raw/hmc/`, and reports how many recording/annotation pairs it found. It
 skips a dataset whose folder already contains `.edf` files (pass `--force` to
 re-extract), so you can equally well extract by hand and skip this step.
+
+ISRUC-Sleep ships as one `.rar` per subject rather than a single archive, so the
+extractor only helps if you happen to have it bundled as a `.zip`; otherwise
+unpack each subject's `.rar` by hand into `data/raw/isruc/<subject>/` and run
+`prepare_isruc.py` directly.
 
 ## Processed format
 

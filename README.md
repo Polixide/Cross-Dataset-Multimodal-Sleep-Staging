@@ -32,12 +32,16 @@ closes that gap with a single coherent benchmark:
 | --- | --- | --- |
 | Development | **Sleep-EDF Expanded** | Training + internal subject-wise validation |
 | External test | **HMC** | PSG-to-PSG cross-dataset generalization |
+| External test | **ISRUC-Sleep (Cohort I)** | Second PSG-to-PSG external test set |
 | Optional extension | **DREAMT** | Wearable transfer — future work (different modality) |
 
 > **Deviation from `docs/master_plan.md`:** the master plan's primary external
 > dataset needs an access agreement that takes weeks to obtain, so this project
 > uses the open-access **HMC** (still PSG-to-PSG) as the external test set
-> instead. DREAMT stays optional.
+> instead. **ISRUC-Sleep Cohort I** is added as a second open-access PSG external
+> test set — it strengthens the cross-dataset generalization evidence the plan
+> asks for (external validation on more than one public dataset) without
+> replacing HMC. DREAMT stays optional.
 
 Data are **not** committed to the repository. See [`data/README.md`](data/README.md)
 for how to obtain and place them.
@@ -86,6 +90,11 @@ python scripts/run_dl.py --data data/processed/sleep_edf.npz --model transformer
 # On Colab GPU: run notebooks/05_colab_dl_benchmark.ipynb (Sleep-EDF benchmark sweep)
 
 # 5. External validation on a second dataset (frozen model)
+#    Build the external epochs first (HMC and/or ISRUC — same channel layout, filter,
+#    resampling and 5-class labels as the development data):
+python scripts/prepare_hmc.py   --raw-dir data/raw/hmc   --out data/processed/hmc.npz
+python scripts/prepare_isruc.py --raw-dir data/raw/isruc --out data/processed/isruc.npz
+
 python scripts/run_external.py --model-path results/logs/ml_model.pkl --external data/processed/hmc.npz
 #    DL: evaluate a saved checkpoint on HMC (no retrain) — outputs match the internal
 #    format, so make_figures.py renders the full HMC figure set for that model
@@ -96,6 +105,16 @@ python scripts/eval_dl_external.py --checkpoint results/logs/dl_cnn_lstm_ctx15.p
 python scripts/make_figures.py --metrics results/tables/dl_cnn_lstm_ctx15_hmc.json \
     --probs results/logs/dl_cnn_lstm_ctx15_hmc_probs.npz \
     --data data/processed/hmc.npz --out-dir results/figures/cnn_lstm_ctx15_hmc
+#    The same three commands run on ISRUC by swapping data/processed/hmc.npz for
+#    data/processed/isruc.npz (and the *_hmc output names for *_isruc).
+
+# 6. Explainability — Grad-CAM overlays for a per-epoch DL checkpoint (context 1).
+#    CNN: single Grad-CAM + per-channel bar; Transformer: per-modality Grad-CAM +
+#    cross-attention. Correct and misclassified example per stage, saved to results/figures/xai/.
+python scripts/explain_dl.py --checkpoint results/logs/dl_transformer_ctx1.pt --data data/processed/sleep_edf.npz
+#    Works on any external set too (match the montage with --channel-names):
+python scripts/explain_dl.py --checkpoint results/logs/dl_cnn_ctx1.pt \
+    --data data/processed/isruc.npz --channel-names C3-A2 C4-A1 LOC-A2 X1
 ```
 
 ## Tests
@@ -157,14 +176,21 @@ The full pipeline is implemented and tested:
   scores, confusion matrices, one-vs-rest AUPRC / ROC-AUC.
 - **Calibration:** raw-vs-calibrated ECE / Brier — isotonic/Platt (ML) and
   temperature scaling (DL) — with reliability diagrams.
-- **Explainability:** SHAP (ML) and Grad-CAM (DL).
+- **Explainability:** SHAP (ML) and Grad-CAM (DL). For deep models,
+  `scripts/explain_dl.py` renders a stacked multi-channel overlay (each channel's
+  signal over its Grad-CAM saliency on a shared time axis) for a correct and a
+  misclassified example of every stage. The CNN uses a single Grad-CAM + a
+  per-channel importance bar; the Cross-Modal Transformer uses a **per-modality**
+  Grad-CAM (EEG/EOG/EMG) plus the CLS cross-attention share, so the figure shows
+  *which modality* and *when* drove the decision.
 - **Validation:** internal held-out test, external cross-dataset validation, and
   LOSO robustness; figures via `make_figures.py`, including two-panel learning
   curves (train-vs-val loss and train-vs-val macro-F1 on shared axes) for the
   overfitting analysis.
 
-The data-preparation scripts (`prepare_sleep_edf.py`, `prepare_hmc.py`) follow
-the standard dataset formats and need the actual datasets in `data/raw/` to run.
+The data-preparation scripts (`prepare_sleep_edf.py`, `prepare_hmc.py`,
+`prepare_isruc.py`) follow the standard dataset formats and need the actual
+datasets in `data/raw/` to run.
 Everything else is verified on synthetic data and
 by the test suite (`pytest`, 33 tests). DL hyperparameter search uses Bayesian
 optimization (Optuna), as recommended in the project plan, and falls back to

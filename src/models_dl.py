@@ -9,11 +9,15 @@ SequenceSleepStager reuses that encoder and adds a Transformer across neighborin
 epochs (temporal context), predicting one label per epoch. A focal loss is
 provided for class imbalance.
 """
+from pathlib import Path
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from src.utils import MODALITY_CHANNELS
+from src.utils import MODALITY_CHANNELS, get_logger
+
+logger = get_logger("models_dl")
 
 
 class TinyCNN1D(nn.Module):
@@ -253,6 +257,17 @@ def load_dl_checkpoint(path, device="cpu"):
     else:
         model = build_dl_model(checkpoint["model"], checkpoint["n_channels"],
                                checkpoint["n_classes"], active_modalities=checkpoint["modalities"])
-    model.load_state_dict(checkpoint["state_dict"])
+    incompatible = model.load_state_dict(checkpoint["state_dict"], strict=False)
+    # Checkpoints saved before the additive `token_positional` embedding lack that
+    # key. It is zero-initialized and purely additive, so leaving it at zeros
+    # reproduces the trained model exactly; any other gap is a genuine mismatch.
+    only_token_positional = all(key.endswith("token_positional") for key in incompatible.missing_keys)
+    if incompatible.unexpected_keys or not only_token_positional:
+        raise RuntimeError(
+            f"Incompatible checkpoint {path}: missing={incompatible.missing_keys}, "
+            f"unexpected={incompatible.unexpected_keys}.")
+    if incompatible.missing_keys:
+        logger.warning("Checkpoint %s predates 'token_positional'; using zeros "
+                       "(reproduces the trained model).", Path(path).name)
     model.to(device).eval()
     return model, checkpoint

@@ -33,6 +33,18 @@ RAW_LABEL_TO_INDEX = {
 # Epochs that are dropped rather than classified.
 DROP_LABELS = {"Sleep stage ?", "Movement time"}
 
+# ISRUC-Sleep numeric hypnogram code -> 5-class index. ISRUC scores with AASM
+# stored as integers, one per 30 s epoch: 0=Wake, 1=N1, 2=N2, 3=N3, 5=REM.
+# Legacy 4 (old R&K N4) is merged into N3 to match RAW_LABEL_TO_INDEX above.
+ISRUC_CODE_TO_INDEX = {
+    0: STAGE_TO_INDEX["Wake"],
+    1: STAGE_TO_INDEX["N1"],
+    2: STAGE_TO_INDEX["N2"],
+    3: STAGE_TO_INDEX["N3"],
+    4: STAGE_TO_INDEX["N3"],  # merge legacy N4 into N3
+    5: STAGE_TO_INDEX["REM"],
+}
+
 
 def map_stage_label(raw_label):
     """Map one raw annotation to a 5-class index, or None if it should be dropped."""
@@ -74,6 +86,20 @@ def stage_label_from_text(description):
     if text in ("R", "REM"):
         return STAGE_TO_INDEX["REM"]
     return None
+
+
+def stage_label_from_code(code):
+    """Map an ISRUC numeric hypnogram code to a 5-class index, or None to drop.
+
+    ISRUC-Sleep stores one integer per 30 s epoch in a plain-text hypnogram
+    (unlike the free-text annotations of Sleep-EDF/HMC). Unrecognized values,
+    including blank lines already filtered upstream, return None so the epoch is
+    dropped rather than misclassified.
+    """
+    try:
+        return ISRUC_CODE_TO_INDEX.get(int(code))
+    except (TypeError, ValueError):
+        return None
 
 
 def filter_and_resample_raw(raw, l_freq=DEFAULT_L_FREQ, h_freq=DEFAULT_H_FREQ,

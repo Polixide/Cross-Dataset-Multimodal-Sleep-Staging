@@ -6,10 +6,12 @@ paths explicitly) and this script unpacks each one into the folder the
 
     data/raw/sleep_edf/   <- Sleep-EDF Expanded zip
     data/raw/hmc/         <- HMC (Haaglanden Medisch Centrum) zip
+    data/raw/isruc/       <- ISRUC-Sleep Cohort I zip
 
 Each archive is recognized automatically from its file name and, if that is
 inconclusive, from the names of the files it contains (a Sleep-EDF archive holds
-``*-PSG.edf`` files; an HMC archive holds ``*_sleepscoring.edf`` files). The
+``*-PSG.edf`` files; an HMC archive holds ``*_sleepscoring.edf`` files; an ISRUC
+archive holds ``*.rec`` files). The
 prepare scripts search recursively, so the archive's own subfolders
 (``sleep-cassette/``, ``recordings/``, ...) are kept as-is; no flattening needed.
 
@@ -25,6 +27,11 @@ Usage:
     python scripts/extract_data.py \
         --sleep-edf-zip data/raw/sleep-edf-database-expanded-1.0.0.zip \
         --hmc-zip data/raw/haaglanden-medisch-centrum-sleep-staging-database-1.1.0.zip
+
+ISRUC-Sleep is distributed as one .rar per subject (not a single zip). If you
+have those, extract them by hand into data/raw/isruc/<subject>/ and run
+prepare_isruc.py directly; this helper only unpacks a single ISRUC .zip if you
+happen to have one.
 """
 import argparse
 import sys
@@ -38,11 +45,11 @@ from src.utils import ensure_dir, get_logger
 logger = get_logger("extract_data")
 
 # Target subfolder (under --raw-dir) for each recognized dataset.
-DATASET_DIRS = {"sleep_edf": "sleep_edf", "hmc": "hmc"}
+DATASET_DIRS = {"sleep_edf": "sleep_edf", "hmc": "hmc", "isruc": "isruc"}
 
 
 def classify_zip(zip_path):
-    """Guess which dataset an archive holds: "sleep_edf", "hmc", or None.
+    """Guess which dataset an archive holds: "sleep_edf", "hmc", "isruc", or None.
 
     Tries the file name first (cheap), then falls back to inspecting the member
     names, which only reads the zip's central directory (no full extraction).
@@ -52,6 +59,8 @@ def classify_zip(zip_path):
         return "sleep_edf"
     if "haaglanden" in name or "hmc" in name:
         return "hmc"
+    if "isruc" in name:
+        return "isruc"
 
     try:
         with zipfile.ZipFile(zip_path) as archive:
@@ -64,6 +73,8 @@ def classify_zip(zip_path):
         return "sleep_edf"
     if any(member.endswith("_sleepscoring.edf") for member in members):
         return "hmc"
+    if any(member.endswith(".rec") for member in members):
+        return "isruc"
     return None
 
 
@@ -95,6 +106,11 @@ def verify(dataset, dest_dir):
         scoring = list(dest_dir.rglob("*_sleepscoring.edf"))
         logger.info("hmc: %d signal file(s), %d scoring file(s).", len(signals), len(scoring))
         return bool(signals) and bool(scoring)
+    if dataset == "isruc":
+        recordings = list(dest_dir.rglob("*.rec"))
+        hypnograms = list(dest_dir.rglob("*_1.txt")) + list(dest_dir.rglob("*_2.txt"))
+        logger.info("isruc: %d recording(s), %d expert hypnogram(s).", len(recordings), len(hypnograms))
+        return bool(recordings) and bool(hypnograms)
     return False
 
 
@@ -106,6 +122,7 @@ def main():
                         help="Base folder; each dataset is extracted to <raw-dir>/<dataset>/.")
     parser.add_argument("--sleep-edf-zip", default=None, help="Explicit path to the Sleep-EDF zip.")
     parser.add_argument("--hmc-zip", default=None, help="Explicit path to the HMC zip.")
+    parser.add_argument("--isruc-zip", default=None, help="Explicit path to an ISRUC-Sleep zip (if bundled).")
     parser.add_argument("--force", action="store_true",
                         help="Re-extract even if the target already contains .edf files.")
     args = parser.parse_args()
@@ -116,6 +133,8 @@ def main():
         jobs["sleep_edf"] = Path(args.sleep_edf_zip)
     if args.hmc_zip:
         jobs["hmc"] = Path(args.hmc_zip)
+    if args.isruc_zip:
+        jobs["isruc"] = Path(args.isruc_zip)
 
     # Fill in any dataset not given explicitly by scanning --zip-dir.
     for zip_path in sorted(Path(args.zip_dir).glob("*.zip")):
@@ -129,7 +148,7 @@ def main():
     if not jobs:
         raise FileNotFoundError(
             f"No dataset zips found. Put the downloads in {args.zip_dir}/ "
-            "or pass --sleep-edf-zip / --hmc-zip."
+            "or pass --sleep-edf-zip / --hmc-zip / --isruc-zip."
         )
 
     all_ok = True
@@ -152,6 +171,9 @@ def main():
     if "hmc" in jobs:
         logger.info("  python scripts/prepare_hmc.py --raw-dir %s --out data/processed/hmc.npz",
                     (raw_dir / "hmc").as_posix())
+    if "isruc" in jobs:
+        logger.info("  python scripts/prepare_isruc.py --raw-dir %s --out data/processed/isruc.npz",
+                    (raw_dir / "isruc").as_posix())
     if not all_ok:
         sys.exit(1)
 

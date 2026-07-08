@@ -22,6 +22,8 @@ Examples:
         --context 11 --tune --search-method bayes --num-workers 2
     python scripts/run_dl.py --data data/processed/sleep_edf.npz --model transformer \
         --context 11 --external data/processed/hmc.npz
+    python scripts/run_dl.py --data data/processed/sleep_edf.npz --model transformer \
+        --context 11 --external data/processed/isruc.npz
 """
 import argparse
 import sys
