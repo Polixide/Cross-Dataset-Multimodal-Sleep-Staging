@@ -32,6 +32,8 @@ results/logs/*
 !results/figures/**/
 !results/figures/**/*.png
 !results/figures/*.png
+!results/logs/**/
+!results/logs/**/*.json
 !results/logs/ml_metrics_rf.json
 !results/logs/ml_metrics_xgb.json
 !results/logs/ml_metrics_logreg.json

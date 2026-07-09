@@ -294,7 +294,7 @@ probabilità raw/calibrate del test.
 
 | Percorso | Contenuto |
 | --- | --- |
-| `results/tables/ml_metrics.csv` | confronto scalare delle run |
+| `results/tables/ml_train_sleep.csv` | confronto scalare delle run train/internal |
 | `results/logs/ml_metrics_<run>.json` | metriche dettagliate e protocollo |
 | `results/logs/ml_model_<run>.pkl` | estimatore addestrato/calibrato |
 | `results/logs/ml_test_probs_<run>.npz` | label, predizioni e probabilità test |

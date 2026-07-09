@@ -6,7 +6,7 @@ evaluates on the held-out internal test subjects. The fitted (calibrated) model
 is saved for external validation, together with the test-set probabilities.
 
 Headline scalar metrics are appended to a shared CSV comparison table
-(results/tables/ml_metrics.csv), one row per model run, so several models can be
+(results/tables/ml_train_sleep.csv), one row per model run, so several models can be
 compared side by side. The detailed nested metrics (confusion matrix, per-class
 arrays) needed by make_figures are saved per model under results/logs/.
 
@@ -107,6 +107,78 @@ def uncalibrated_probabilities(estimator, x):
     return softmax(scores, axis=1)
 
 
+def suffixed_path(path, suffix):
+    """Insert a suffix before the file extension."""
+    path = Path(path)
+    return path.with_name(f"{path.stem}_{suffix}{path.suffix}")
+
+
+def output_paths(args, calibration, multi_output):
+    """Return artifact paths for one calibration variant."""
+    suffix = "raw" if calibration == "none" else calibration
+    if not multi_output:
+        return Path(args.json_out), Path(args.model_out), Path(args.probs_out)
+    return (
+        suffixed_path(args.json_out, suffix),
+        suffixed_path(args.model_out, suffix),
+        suffixed_path(args.probs_out, suffix),
+    )
+
+
+def save_run_outputs(args, calibration, fitted_model, y_true, y_pred, y_pred_raw,
+                     y_prob, y_prob_raw, test_metrics, test_metrics_raw,
+                     prob_metrics, prob_metrics_raw, cv_summary, overfitting,
+                     tuning_selection, best_params, multi_output):
+    """Persist model, probabilities, JSON metrics, and the CSV row for one run."""
+    json_out, model_out, probs_out = output_paths(args, calibration, multi_output)
+
+    save_pickle(fitted_model, model_out)
+    ensure_dir(probs_out.parent)
+    np.savez_compressed(
+        probs_out,
+        y_true=y_true,
+        y_pred_raw=y_pred_raw,
+        y_pred_calibrated=y_pred,
+        y_prob_raw=y_prob_raw,
+        y_prob=y_prob,
+        y_prob_calibrated=y_prob,
+    )
+    save_json({
+        "model": args.model, "balance": args.balance,
+        "tuned": bool(args.tune or args.params_from), "best_params": best_params,
+        "calibration": calibration,
+        "protocol": {
+            "cross_validation": "training_subjects_only",
+            "validation_role": (
+                "probability_calibration_only" if calibration != "none"
+                else "not_used_for_uncalibrated_output"
+            ),
+            "test_role": "final_evaluation_only",
+        },
+        "cv_summary": cv_summary,
+        "overfitting": overfitting,
+        "tuning_selection": tuning_selection,
+        "test_metrics": test_metrics,
+        "test_metrics_raw": test_metrics_raw,
+        "test_metrics_calibrated": test_metrics if calibration != "none" else None,
+        "test_prob_metrics_raw": prob_metrics_raw,
+        "test_prob_metrics_calibrated": prob_metrics if calibration != "none" else None,
+    }, json_out)
+
+    row = metrics_row(
+        args.model, args.balance, calibration,
+        bool(args.tune or args.params_from), loso=False,
+        test_metrics=test_metrics, cv_summary=cv_summary,
+        prob_metrics=prob_metrics, best_params=best_params,
+        overfitting=overfitting,
+    )
+    append_metrics_row(row, args.out, KEY_COLS)
+    logger.info(
+        "Saved %s metrics to %s and model to %s",
+        calibration, json_out, model_out,
+    )
+
+
 def run_loso(x, y, subjects, model, balance, out_path, json_path, best_params=None):
     """Leave-one-subject-out robustness analysis (secondary)."""
     y_true, y_pred = [], []
@@ -153,15 +225,17 @@ def main():
                         help="Metrics JSON whose best_params are reused without tuning.")
     parser.add_argument(
         "--calibration",
-        default="sigmoid",
+        default=None,
         choices=["none", "sigmoid", "isotonic"],
-        help=("Probability calibration fitted on validation subjects. "
+        help=("Probability calibration fitted on validation subjects. If omitted, "
+              "both uncalibrated ('none') and sigmoid-calibrated outputs are saved "
+              "after a single GroupKFold tuning/CV pass. "
               "Use 'none' to keep the estimator's native probabilities. "
               "Sigmoid is the safer default; isotonic is more flexible but can alter "
               "minority-class decisions aggressively."),
     )
     parser.add_argument("--sfreq", type=float, default=100.0)
-    parser.add_argument("--out", default="results/tables/ml_metrics.csv",
+    parser.add_argument("--out", default="results/tables/ml_train_sleep.csv",
                         help="Comparison table (CSV). Accumulates one row per "
                              "model run instead of overwriting.")
     parser.add_argument("--json-out", default=None,
@@ -282,72 +356,39 @@ def main():
     test_metrics_raw = compute_metrics(y[test_idx], y_pred_raw, labels=LABELS)
     prob_metrics_raw = probabilistic_metrics(y[test_idx], prob_raw)
 
-    # Optionally fit calibration on validation subjects, then evaluate on test.
-    if args.calibration == "none":
-        fitted_output_model = final_model
-        y_pred_cal = y_pred_raw
-        prob_cal = prob_raw
-        test_metrics_cal = test_metrics_raw
-        prob_metrics_cal = prob_metrics_raw
-        logger.info("Calibration disabled; retaining native model probabilities.")
-    else:
-        fitted_output_model = calibrate_classifier(
-            final_model, x[val_idx], y[val_idx], method=args.calibration
+    calibration_modes = ["none", "sigmoid"] if args.calibration is None else [args.calibration]
+    multi_output = len(calibration_modes) > 1
+    for calibration in calibration_modes:
+        if calibration == "none":
+            logger.info("Calibration disabled; retaining native model probabilities.")
+            save_run_outputs(
+                args, calibration, final_model,
+                y[test_idx], y_pred_raw, y_pred_raw, prob_raw, prob_raw,
+                test_metrics_raw, test_metrics_raw, prob_metrics_raw, prob_metrics_raw,
+                cv_summary, overfitting, tuning_selection, best_params, multi_output,
+            )
+            continue
+
+        calibrated_model = calibrate_classifier(
+            final_model, x[val_idx], y[val_idx], method=calibration
         )
-        y_pred_cal = fitted_output_model.predict(x[test_idx])
-        prob_cal = fitted_output_model.predict_proba(x[test_idx])
+        y_pred_cal = calibrated_model.predict(x[test_idx])
+        prob_cal = calibrated_model.predict_proba(x[test_idx])
         test_metrics_cal = compute_metrics(y[test_idx], y_pred_cal, labels=LABELS)
         prob_metrics_cal = probabilistic_metrics(y[test_idx], prob_cal)
+        logger.info(
+            "Test macro-F1 raw %.3f -> %s %.3f | ECE raw %.3f -> %s %.3f",
+            test_metrics_raw["macro_f1"], calibration, test_metrics_cal["macro_f1"],
+            prob_metrics_raw["ece"], calibration, prob_metrics_cal["ece"],
+        )
+        save_run_outputs(
+            args, calibration, calibrated_model,
+            y[test_idx], y_pred_cal, y_pred_raw, prob_cal, prob_raw,
+            test_metrics_cal, test_metrics_raw, prob_metrics_cal, prob_metrics_raw,
+            cv_summary, overfitting, tuning_selection, best_params, multi_output,
+        )
 
-    logger.info(
-        "Test macro-F1 raw %.3f -> calibrated %.3f | ECE raw %.3f -> calibrated %.3f",
-        test_metrics_raw["macro_f1"], test_metrics_cal["macro_f1"],
-        prob_metrics_raw["ece"], prob_metrics_cal["ece"],
-    )
-
-    save_pickle(fitted_output_model, args.model_out)
-    ensure_dir(Path(args.probs_out).parent)
-    np.savez_compressed(
-        args.probs_out,
-        y_true=y[test_idx],
-        y_pred_raw=y_pred_raw,
-        y_pred_calibrated=y_pred_cal,
-        y_prob_raw=prob_raw,
-        y_prob=prob_cal,  # Backward-compatible name for calibrated probabilities.
-        y_prob_calibrated=prob_cal,
-    )
-    # Detailed nested metrics (confusion matrix, per-class arrays) for figures.
-    save_json({
-        "model": args.model, "balance": args.balance,
-        "tuned": bool(args.tune or args.params_from), "best_params": best_params,
-        "calibration": args.calibration,
-        "protocol": {
-            "cross_validation": "training_subjects_only",
-            "validation_role": "probability_calibration_only",
-            "test_role": "final_evaluation_only",
-        },
-        "cv_summary": cv_summary,
-        "overfitting": overfitting,
-        "tuning_selection": tuning_selection,
-        # Keep test_metrics as the calibrated result for compatibility with
-        # existing consumers, while exposing both variants explicitly.
-        "test_metrics": test_metrics_cal,
-        "test_metrics_raw": test_metrics_raw,
-        "test_metrics_calibrated": test_metrics_cal,
-        "test_prob_metrics_raw": prob_metrics_raw,
-        "test_prob_metrics_calibrated": prob_metrics_cal,
-    }, args.json_out)
-
-    # Append the headline scalars to the shared CSV comparison table.
-    row = metrics_row(
-        args.model, args.balance, args.calibration,
-        bool(args.tune or args.params_from), loso=False,
-        test_metrics=test_metrics_cal, cv_summary=cv_summary,
-        prob_metrics=prob_metrics_cal, best_params=best_params,
-        overfitting=overfitting,
-    )
-    append_metrics_row(row, args.out, KEY_COLS)
-    logger.info("Appended metrics to %s and saved model to %s", args.out, args.model_out)
+    logger.info("Appended metrics to %s", args.out)
 
 
 if __name__ == "__main__":

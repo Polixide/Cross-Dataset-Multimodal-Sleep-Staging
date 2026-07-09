@@ -69,6 +69,10 @@ python scripts/data/prepare_sleep_edf.py --raw-dir data/raw/sleep_edf --out data
 # 2. Feature-based ML with subject-wise cross-validation
 python scripts/ml/run_ml.py --data data/processed/sleep_edf.npz --model rf
 
+# If --calibration is omitted, run_ml.py saves both *_raw and *_sigmoid outputs
+# after one shared tuning/CV pass. Use --calibration none/sigmoid/isotonic to
+# save only one variant.
+
 # 3. Deep learning — Cross-Modal Transformer with temporal context
 python scripts/dl/run_dl.py --data data/processed/sleep_edf.npz --model transformer --context 11
 
@@ -204,7 +208,7 @@ more informative than treating LOSO as a separate overfitting gap.
 ### Outputs
 
 ```text
-results/tables/ml_metrics.csv               comparison table
+results/tables/ml_train_sleep.csv           train/internal comparison table
 results/tables/ml_workflow_summary.csv      complete workflow summary
 results/logs/ml_metrics_<run>.json          detailed metrics and protocol
 results/logs/ml_model_<run>.pkl             calibrated fitted estimator

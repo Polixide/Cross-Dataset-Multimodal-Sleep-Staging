@@ -45,6 +45,9 @@ def confusion_and_f1(metrics):
     if "test_metrics" in metrics:
         block = metrics["test_metrics"]
         return np.array(block["confusion_matrix"]), np.array(block["per_class_f1"])
+    if "metrics" in metrics and "confusion_matrix" in metrics["metrics"]:
+        block = metrics["metrics"]
+        return np.array(block["confusion_matrix"]), np.array(block["per_class_f1"])
     if "loso_metrics" in metrics:
         block = metrics["loso_metrics"]
         return np.array(block["confusion_matrix"]), np.array(block["per_class_f1"])
